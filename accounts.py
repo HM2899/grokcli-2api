@@ -111,31 +111,67 @@ def _is_headless() -> bool:
     return not bool(display)
 
 
+def _resolve_account_key(data: dict, account_id: str) -> str | None:
+    if account_id in data:
+        return account_id
+    for k, v in data.items():
+        if k == account_id:
+            return k
+        if isinstance(v, dict) and (
+            v.get("user_id") == account_id or k.endswith(f"::{account_id}")
+        ):
+            return k
+    return None
+
+
 def remove_account(account_id: str) -> bool:
     data = read_auth_map()
-    if account_id not in data:
-        matched = None
-        for k, v in data.items():
-            if k == account_id:
-                matched = k
-                break
-            if isinstance(v, dict) and (
-                v.get("user_id") == account_id or k.endswith(f"::{account_id}")
-            ):
-                matched = k
-                break
-        if matched is None:
-            return False
-        account_id = matched
+    matched = _resolve_account_key(data, account_id)
+    if matched is None:
+        return False
     if AUTH_FILE.is_file():
         backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
         try:
             shutil.copy2(AUTH_FILE, backup)
         except OSError:
             pass
-    del data[account_id]
+    del data[matched]
     write_auth_map(data)
     return True
+
+
+def remove_accounts(account_ids: list[str]) -> dict:
+    """Remove many accounts with a single auth.json rewrite."""
+    data = read_auth_map()
+    removed: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for raw in account_ids:
+        account_id = str(raw or "").strip()
+        if not account_id or account_id in seen:
+            continue
+        seen.add(account_id)
+        matched = _resolve_account_key(data, account_id)
+        if matched is None or matched not in data:
+            missing.append(account_id)
+            continue
+        del data[matched]
+        removed.append(matched)
+    if removed:
+        if AUTH_FILE.is_file():
+            backup = AUTH_FILE.with_suffix(f".bak.{int(time.time())}")
+            try:
+                shutil.copy2(AUTH_FILE, backup)
+            except OSError:
+                pass
+        write_auth_map(data)
+    return {
+        "removed": removed,
+        "missing": missing,
+        "removed_count": len(removed),
+        "missing_count": len(missing),
+        "requested": len(seen),
+    }
 
 
 def clear_all_accounts() -> bool:

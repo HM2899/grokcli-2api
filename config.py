@@ -166,6 +166,16 @@ REQUIRE_API_KEY = os.getenv("GROK2API_REQUIRE_API_KEY", "auto")
 # Request timeout (seconds) for non-stream collection
 TIMEOUT = float(os.getenv("GROK2API_TIMEOUT", "600"))
 
+# SSE idle keepalive interval for secondary relays (new-api / nginx).
+# Emit `: keepalive` comments when upstream is silent (thinking gaps).
+SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "8"))
+
+# Compatibility for relays/UIs that only render delta.content (not reasoning_content).
+# - off: pass through reasoning_content only
+# - think_tag: stream reasoning as content wrapped in <think>...</think>
+# - content: merge reasoning into content without tags
+REASONING_COMPAT = os.getenv("GROK2API_REASONING_COMPAT", "think_tag").strip().lower()
+
 # Map common aliases -> real model ids (OpenAI + Anthropic client defaults)
 MODEL_ALIASES: dict[str, str] = {
     "gpt-4": DEFAULT_MODEL,

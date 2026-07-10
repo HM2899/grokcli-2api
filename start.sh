@@ -16,13 +16,13 @@ if ! $PY -c "import fastapi, uvicorn, httpx" 2>/dev/null; then
   $PY -m pip install -r requirements.txt
 fi
 
-if ! $PY -c "import curl_cffi, requests, DrissionPage" 2>/dev/null; then
+if ! $PY -c "import curl_cffi, requests" 2>/dev/null; then
   echo "Installing remaining dependencies..."
   $PY -m pip install -r requirements.txt
 fi
 
-# Vendored grok-register package path
-export PYTHONPATH="$(pwd)/vendors/grok-register${PYTHONPATH:+:$PYTHONPATH}"
+# Vendored grok-build-auth package path
+export PYTHONPATH="$(pwd)/grok-build-auth${PYTHONPATH:+:$PYTHONPATH}"
 
 export GROK2API_OPEN_BROWSER="${GROK2API_OPEN_BROWSER:-0}"
 export GROK2API_HOST="${GROK2API_HOST:-127.0.0.1}"
@@ -36,6 +36,7 @@ echo "  Admin:  http://127.0.0.1:${PORT}/admin"
 echo "  Health: http://127.0.0.1:${PORT}/health"
 echo "  OpenAI: http://127.0.0.1:${PORT}/v1"
 echo "  Account mode: ${GROK2API_ACCOUNT_MODE}"
+echo "  Registration: grok-build-auth (HTTP protocol, no browser)"
 echo ""
 
 exec $PY app.py

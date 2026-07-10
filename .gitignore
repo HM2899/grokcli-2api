@@ -11,10 +11,11 @@ data/
 *.log
 .idea/
 .vscode/
+# leftover / accidental trees
 register/
+vendors/
 # vendored registration runtime artifacts
-vendors/grok-register/sso/
-vendors/grok-register/logs/
-vendors/grok-register/config.json
-vendors/grok-register/**/__pycache__/
+grok-build-auth/**/__pycache__/
+grok-build-auth/cliproxyapi_auth/
+grok-build-auth/.env
 data/register_sso/

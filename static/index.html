@@ -799,11 +799,28 @@
             <pre class="codebox" id="device-log" style="margin-top:10px;max-height:140px;overflow:auto"></pre>
           </div>
 
+          <div class="row" style="margin-bottom:12px;align-items:end">
+            <div style="flex:1 1 280px;min-width:220px">
+              <label>搜索账号</label>
+              <input id="acc-search" placeholder="邮箱 / 账号 ID / 状态关键字" />
+            </div>
+            <div style="flex:0 0 auto;display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn sm" id="btn-acc-search">搜索</button>
+              <button class="btn sm" id="btn-acc-search-clear">清空</button>
+              <button class="btn sm" id="btn-acc-select-page">全选本页</button>
+              <button class="btn sm" id="btn-acc-select-all-filtered">全选筛选结果</button>
+              <button class="btn sm" id="btn-acc-select-none">取消选择</button>
+              <button class="btn sm danger" id="btn-acc-delete-selected">删除所选</button>
+            </div>
+          </div>
+          <div id="acc-selection-info" class="muted" style="margin-bottom:10px;font-size:0.84rem">已选 0 个</div>
+
           <div id="accounts-empty" class="muted hidden" style="padding:8px 0">暂无账号，请设备码登录或导入 Token。</div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
+                  <th style="width:36px"><input type="checkbox" id="acc-check-page" title="全选本页" /></th>
                   <th>邮箱</th><th>状态</th><th>池</th><th>本地请求</th><th>额度</th><th>模型探测</th><th>过期 / 剩余</th><th></th>
                 </tr>
               </thead>
@@ -870,6 +887,18 @@
             <div>
               <label>代理密码</label>
               <input id="reg-proxy-password" type="password" />
+            </div>
+            <div>
+              <label>注册数量（多线程）</label>
+              <input id="reg-count" type="number" min="1" max="50" value="1" inputmode="numeric" />
+            </div>
+            <div>
+              <label>并发数</label>
+              <input id="reg-concurrency" type="number" min="1" max="10" value="3" inputmode="numeric" />
+            </div>
+            <div>
+              <label>启动间隔（毫秒）</label>
+              <input id="reg-stagger-ms" type="number" min="0" max="10000" value="400" inputmode="numeric" />
             </div>
           </div>
           <div class="actions" style="margin-top:12px">
@@ -1326,16 +1355,59 @@ let quotaCache = {};
 let accountsList = [];
 let accountsPage = 1;
 let accountsPageSize = 25;
+let accountsSearchQuery = "";
+let selectedAccountIds = new Set();
+
+function getFilteredAccounts() {
+  const q = (accountsSearchQuery || "").trim().toLowerCase();
+  if (!q) return accountsList.slice();
+  return accountsList.filter(a => {
+    const p = a._pool || {};
+    const hay = [
+      a.email || "",
+      a.id || "",
+      a.user_id || "",
+      a.expired ? "expired 已过期" : "valid 有效",
+      p.enabled === false ? "disabled 已禁用" : "enabled 启用",
+      p.in_cooldown ? "cooldown 冷却" : "",
+      p.disabled_for_quota ? "quota 额度禁用 耗尽" : "",
+      p.last_error || "",
+      (p.blocked_model_ids || []).join(" "),
+    ].join(" ").toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+function updateAccountSelectionInfo(filteredCount, pageCount) {
+  const el = $("acc-selection-info");
+  if (!el) return;
+  const selected = selectedAccountIds.size;
+  const q = (accountsSearchQuery || "").trim();
+  el.textContent = q
+    ? `已选 ${selected} 个 · 筛选 ${filteredCount} / 全部 ${accountsList.length} · 本页 ${pageCount}`
+    : `已选 ${selected} 个 · 全部 ${accountsList.length} · 本页 ${pageCount}`;
+  const pageCheck = $("acc-check-page");
+  if (pageCheck) {
+    const pageIds = Array.from(document.querySelectorAll(".acc-check-one")).map(x => x.dataset.id);
+    const selectedOnPage = pageIds.filter(id => selectedAccountIds.has(id)).length;
+    pageCheck.checked = pageIds.length > 0 && selectedOnPage === pageIds.length;
+    pageCheck.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
+  }
+}
 
 function renderAccountsPage() {
-  const list = accountsList;
+  const list = getFilteredAccounts();
   const pageSize = accountsPageSize;
-  const totalPages = Math.max(1, Math.ceil(list.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(list.length / pageSize) || 1);
   accountsPage = Math.max(1, Math.min(accountsPage, totalPages));
   const start = (accountsPage - 1) * pageSize;
   const pageItems = list.slice(start, start + pageSize);
 
-  $("accounts-empty").classList.toggle("hidden", list.length > 0);
+  // Drop selections that no longer exist
+  const validIds = new Set(accountsList.map(a => a.id));
+  selectedAccountIds = new Set(Array.from(selectedAccountIds).filter(id => validIds.has(id)));
+
+  $("accounts-empty").classList.toggle("hidden", accountsList.length > 0);
   const tbody = $("accounts-tbody");
   tbody.innerHTML = pageItems.map(a => {
     const p = a._pool || { id: a.id };
@@ -1357,8 +1429,10 @@ function renderAccountsPage() {
       ? `<span class="pill ${remCls}">剩余 ${esc(fmtRemaining(a.expires_at))}</span>`
       : '<span class="muted">—</span>';
     const probeCell = fmtProbeCell(p.last_probe, p.last_error, p.blocked_model_ids);
+    const checked = selectedAccountIds.has(a.id) ? "checked" : "";
     return `
     <tr>
+      <td><input type="checkbox" class="acc-check-one" data-id="${esc(a.id)}" ${checked} /></td>
       <td>${esc(a.email || "—")}<div class="muted mono" style="font-size:0.72rem">${esc(a.id)}</div></td>
       <td>${a.expired ? '<span class="pill bad">已过期</span>' : '<span class="pill ok">有效</span>'}</td>
       <td>${poolLabel}</td>
@@ -1376,11 +1450,12 @@ function renderAccountsPage() {
         <button class="btn sm danger" data-act="rm-acc" data-id="${esc(a.id)}">移除</button>
       </td>
     </tr>`;
-  }).join("") || `<tr><td colspan="8" class="muted">无账号</td></tr>`;
+  }).join("") || `<tr><td colspan="9" class="muted">${accountsList.length ? "无匹配账号" : "无账号"}</td></tr>`;
 
-  $("acc-page-info").textContent = `${accountsPage} / ${totalPages} (共 ${list.length} 个)`;
+  $("acc-page-info").textContent = `${accountsPage} / ${totalPages} (显示 ${list.length} / 共 ${accountsList.length} 个)`;
   $("acc-page-prev").disabled = accountsPage <= 1;
   $("acc-page-next").disabled = accountsPage >= totalPages;
+  updateAccountSelectionInfo(list.length, pageItems.length);
 }
 
 function renderAccounts() {
@@ -1393,6 +1468,54 @@ function renderAccounts() {
   }).catch(e => toast(e.message, false));
 }
 
+function applyAccountSearch(resetPage = true) {
+  accountsSearchQuery = $("acc-search") ? $("acc-search").value.trim() : "";
+  if (resetPage) accountsPage = 1;
+  renderAccountsPage();
+}
+
+function setPageSelection(checked) {
+  document.querySelectorAll(".acc-check-one").forEach(el => {
+    const id = el.dataset.id;
+    if (!id) return;
+    el.checked = !!checked;
+    if (checked) selectedAccountIds.add(id);
+    else selectedAccountIds.delete(id);
+  });
+  updateAccountSelectionInfo(getFilteredAccounts().length, document.querySelectorAll(".acc-check-one").length);
+}
+
+function setFilteredSelection(checked) {
+  const list = getFilteredAccounts();
+  list.forEach(a => {
+    if (!a.id) return;
+    if (checked) selectedAccountIds.add(a.id);
+    else selectedAccountIds.delete(a.id);
+  });
+  renderAccountsPage();
+}
+
+async function deleteSelectedAccounts() {
+  const ids = Array.from(selectedAccountIds);
+  if (!ids.length) {
+    toast("请先勾选要删除的账号", false);
+    return;
+  }
+  if (!confirm(`确定删除选中的 ${ids.length} 个账号？此操作会从 auth.json 移除。`)) return;
+  try {
+    const r = await api("/accounts/delete-batch", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+    selectedAccountIds.clear();
+    toast(`已删除 ${r.removed_count || 0} 个` + (r.missing_count ? `，未找到 ${r.missing_count}` : ""));
+    statusCache = await api("/status");
+    await loadDashboard();
+  } catch (e) {
+    toast(e.message, false);
+  }
+}
+
 $("acc-page-prev").onclick = () => { if (accountsPage > 1) { accountsPage--; renderAccountsPage(); } };
 $("acc-page-next").onclick = () => { accountsPage++; renderAccountsPage(); };
 $("acc-page-size").onchange = () => {
@@ -1400,6 +1523,27 @@ $("acc-page-size").onchange = () => {
   accountsPage = 1;
   renderAccountsPage();
 };
+
+if ($("btn-acc-search")) $("btn-acc-search").onclick = () => applyAccountSearch(true);
+if ($("btn-acc-search-clear")) $("btn-acc-search-clear").onclick = () => {
+  if ($("acc-search")) $("acc-search").value = "";
+  applyAccountSearch(true);
+};
+if ($("acc-search")) {
+  $("acc-search").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") applyAccountSearch(true);
+  });
+}
+if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
+if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => setFilteredSelection(true);
+if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => {
+  selectedAccountIds.clear();
+  renderAccountsPage();
+};
+if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
+if ($("acc-check-page")) {
+  $("acc-check-page").onchange = (e) => setPageSelection(!!e.target.checked);
+}
 
 function fmtProbeCell(lastProbe, lastError, blockedIds) {
   const lp = lastProbe || null;
@@ -1652,6 +1796,9 @@ function readRegConfig() {
     proxy: $("reg-proxy") ? $("reg-proxy").value.trim() : "",
     proxy_username: $("reg-proxy-username") ? $("reg-proxy-username").value.trim() : "",
     proxy_password: $("reg-proxy-password") ? $("reg-proxy-password").value.trim() : "",
+    count: $("reg-count") ? $("reg-count").value.trim() : "1",
+    concurrency: $("reg-concurrency") ? $("reg-concurrency").value.trim() : "3",
+    stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "400",
   };
 }
 function applyRegConfig(cfg) {
@@ -1665,6 +1812,9 @@ function applyRegConfig(cfg) {
   if ($("reg-proxy")) $("reg-proxy").value = cfg.proxy || "";
   if ($("reg-proxy-username")) $("reg-proxy-username").value = cfg.proxy_username || "";
   if ($("reg-proxy-password")) $("reg-proxy-password").value = cfg.proxy_password || "";
+  if ($("reg-count")) $("reg-count").value = cfg.count || "1";
+  if ($("reg-concurrency")) $("reg-concurrency").value = cfg.concurrency || "3";
+  if ($("reg-stagger-ms")) $("reg-stagger-ms").value = cfg.stagger_ms || "400";
 }
 function saveRegConfig() {
   localStorage.setItem(REG_CONFIG_KEY, JSON.stringify(readRegConfig()));
@@ -1686,6 +1836,12 @@ function buildRegBody(config) {
   if (config.proxy) body.proxy = config.proxy;
   if (config.proxy_username) body.proxy_username = config.proxy_username;
   if (config.proxy_password) body.proxy_password = config.proxy_password;
+  const count = Number.parseInt(config.count || "1", 10);
+  const concurrency = Number.parseInt(config.concurrency || "3", 10);
+  const stagger = Number.parseInt(config.stagger_ms || "400", 10);
+  if (Number.isFinite(count) && count > 0) body.count = Math.min(50, count);
+  if (Number.isFinite(concurrency) && concurrency > 0) body.concurrency = Math.min(10, concurrency);
+  if (Number.isFinite(stagger) && stagger >= 0) body.stagger_ms = Math.min(10000, stagger);
   return body;
 }
 function buildProxyTestBody(config) {
@@ -1751,21 +1907,51 @@ async function pollRegSession() {
         sessions.push(await api("/accounts/register-email/sessions/" + id));
       } catch (_) {}
     }
+    // Also pull all active sessions so late-spawned batch workers appear.
+    try {
+      const all = await api("/accounts/register-email/sessions");
+      if (all && Array.isArray(all.sessions)) {
+        const known = new Set(sessions.map(s => s.id || s.session_id));
+        for (const s of all.sessions) {
+          const id = s.id || s.session_id;
+          if (id && !known.has(id) && regSessionIds.includes(id)) {
+            sessions.push(s);
+            known.add(id);
+          }
+          // Expand tracked ids if batch still spawning
+          if (id && s.batch_id && sessions.some(x => x.batch_id === s.batch_id) && !regSessionIds.includes(id)) {
+            regSessionIds.push(id);
+            if (!known.has(id)) { sessions.push(s); known.add(id); }
+          }
+        }
+      }
+    } catch (_) {}
     if (!sessions.length) return;
     if (sessions.length === 1) showRegSession(sessions[0]);
     else showRegSessionGroup(sessions);
-    const done = sessions.every(s => s.status === "success" || s.status === "completed" || s.status === "imported");
-    const failed = sessions.every(s => ["error", "failed", "expired", "protocol_error", "protocol_blocked"].includes(s.status));
+    const terminalOk = new Set(["success", "completed", "imported"]);
+    const terminalBad = new Set(["error", "failed", "expired", "protocol_error", "protocol_blocked"]);
+    const done = sessions.every(s => terminalOk.has(s.status));
+    const failed = sessions.every(s => terminalBad.has(s.status));
+    const finished = sessions.every(s => terminalOk.has(s.status) || terminalBad.has(s.status));
     if (done) {
-      toast("邮箱注册完成，账号已导入");
+      toast(`邮箱注册完成：${sessions.length} 个账号已导入`);
       clearInterval(regPollTimer);
       regPollTimer = null;
       statusCache = await api("/status");
       await loadDashboard();
     } else if (failed) {
-      toast("注册会话已停止，请查看日志", false);
+      toast("注册会话全部失败，请查看日志", false);
       clearInterval(regPollTimer);
       regPollTimer = null;
+    } else if (finished) {
+      const ok = sessions.filter(s => terminalOk.has(s.status)).length;
+      const bad = sessions.length - ok;
+      toast(`批量注册结束：成功 ${ok} · 失败 ${bad}`, ok > 0);
+      clearInterval(regPollTimer);
+      regPollTimer = null;
+      statusCache = await api("/status");
+      await loadDashboard();
     }
   } catch (_) {}
 }
@@ -1894,6 +2080,17 @@ $("keys-tbody").onclick = async (e) => {
 };
 
 $("accounts-tbody").onclick = async (e) => {
+  // checkbox selection
+  const chk = e.target.closest(".acc-check-one");
+  if (chk) {
+    const id = chk.dataset.id;
+    if (!id) return;
+    if (chk.checked) selectedAccountIds.add(id);
+    else selectedAccountIds.delete(id);
+    updateAccountSelectionInfo(getFilteredAccounts().length, document.querySelectorAll(".acc-check-one").length);
+    return;
+  }
+
   const btn = e.target.closest("button");
   if (!btn) return;
   const id = btn.dataset.id;
@@ -1920,6 +2117,7 @@ $("accounts-tbody").onclick = async (e) => {
     } else if (btn.dataset.act === "rm-acc") {
       if (!confirm("确定从 auth.json 移除此账号？")) return;
       await api("/accounts/" + encodeURIComponent(id), { method: "DELETE" });
+      selectedAccountIds.delete(id);
       toast("已移除");
     }
     statusCache = await api("/status");
@@ -2205,13 +2403,43 @@ if ($("btn-start-reg")) {
         method: "POST",
         body: JSON.stringify(buildRegBody(config)),
       });
-      regSessionId = r.id || r.session_id || null;
-      regSessionIds = regSessionId ? [regSessionId] : [];
-      showRegSession(r);
+      // Batch multi-thread response
+      if (r.batch || (Array.isArray(r.session_ids) && r.session_ids.length > 1) || (Array.isArray(r.sessions) && r.sessions.length > 1)) {
+        regSessionIds = Array.isArray(r.session_ids) && r.session_ids.length
+          ? r.session_ids.slice()
+          : (Array.isArray(r.sessions) ? r.sessions.map(s => s.id || s.session_id).filter(Boolean) : []);
+        regSessionId = regSessionIds[0] || r.id || r.session_id || null;
+        if (Array.isArray(r.sessions) && r.sessions.length) {
+          showRegSessionGroup(r.sessions);
+        } else {
+          showRegSessionGroup(regSessionIds.map(id => ({ id, status: "starting" })));
+        }
+        $("reg-session-box").classList.remove("hidden");
+        $("reg-email").textContent = `批量注册 × ${r.count || regSessionIds.length || "?"}`;
+        $("reg-status").textContent = r.message || `concurrency=${r.concurrency || "?"} · batch=${r.batch_id || "—"}`;
+        toast(`已启动批量注册：${r.count || regSessionIds.length} 个 / 并发 ${r.concurrency || "?"}`);
+      } else {
+        regSessionId = r.id || r.session_id || null;
+        regSessionIds = regSessionId ? [regSessionId] : [];
+        showRegSession(r);
+        toast(r.email ? ("已启动: " + r.email) : "已启动邮箱注册");
+      }
       clearInterval(regPollTimer);
-      regPollTimer = setInterval(pollRegSession, 3000);
-      setTimeout(pollRegSession, 1200);
-      toast(r.email ? ("已启动: " + r.email) : "已启动邮箱注册");
+      regPollTimer = setInterval(pollRegSession, 2500);
+      setTimeout(pollRegSession, 800);
+      // Batch may still be spawning — refresh ids shortly after
+      if (r.batch_id) {
+        setTimeout(async () => {
+          try {
+            const b = await api("/accounts/register-email/batches/" + encodeURIComponent(r.batch_id));
+            if (Array.isArray(b.session_ids) && b.session_ids.length) {
+              regSessionIds = b.session_ids.slice();
+              regSessionId = regSessionIds[0];
+            }
+            if (Array.isArray(b.sessions) && b.sessions.length) showRegSessionGroup(b.sessions);
+          } catch (_) {}
+        }, 1500);
+      }
     } catch (e) {
       toast(e.message, false);
     } finally {

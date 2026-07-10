@@ -10,6 +10,7 @@ data
 .env
 .env.*
 register
+vendors
 **/.pytest_cache
 **/sso_output
 **/oauth_output

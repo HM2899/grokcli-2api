@@ -5,8 +5,6 @@ curl_cffi>=0.7.0
 socksio>=1.0.0
 pydantic>=2.0.0
 python-multipart>=0.0.9
-# registration engine (509992828/grok-register browser automation + MoeMail)
+# registration engine (dongguatanglinux/grok-build-auth HTTP protocol + MoeMail)
 requests>=2.31.0
 python-dotenv>=1.0.0
-DrissionPage==4.1.0.9
-pyvirtualdisplay>=3.0

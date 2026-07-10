@@ -22,9 +22,9 @@ from auth import AuthError, load_credentials
 import config as _config
 import sso_to_auth_json as sso_import
 
-# Registration adapter: 509992828/grok-register browser runner + MoeMail.
+# Registration adapter: dongguatanglinux/grok-build-auth protocol client.
 try:
-    import register_runner as reg_adapter
+    import grok_build_adapter as reg_adapter
 except Exception as _reg_import_err:  # noqa: BLE001
     reg_adapter = None  # type: ignore[assignment]
     _REG_IMPORT_ERROR = str(_reg_import_err)
@@ -130,6 +130,25 @@ class EmailRegistrationBody(BaseModel):
     proxy: str | None = Field(default=None, max_length=512)
     proxy_username: str | None = Field(default=None, max_length=256)
     proxy_password: str | None = Field(default=None, max_length=512)
+    # Multi-thread batch registration
+    count: int | None = Field(
+        default=1,
+        ge=1,
+        le=50,
+        description="How many accounts to register (batch/multi-thread)",
+    )
+    concurrency: int | None = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Max concurrent registration workers",
+    )
+    stagger_ms: int | None = Field(
+        default=400,
+        ge=0,
+        le=10000,
+        description="Stagger delay between worker starts (ms)",
+    )
 
 
 class EmailRegistrationProxyTestBody(BaseModel):
@@ -578,9 +597,9 @@ def _require_register_adapter():
             status_code=503,
             detail=(
                 "注册机模块不可用: "
-                f"{_REG_IMPORT_ERROR or 'register_runner import failed'}. "
-                "请执行: pip install -r requirements.txt "
-                "(需要 DrissionPage / chromium / xvfb；邮箱使用 MoeMail)"
+                f"{_REG_IMPORT_ERROR or 'grok_build_adapter import failed'}. "
+                "请确认 grok-build-auth/ 已完整检出，并执行: pip install -r requirements.txt "
+                "(协议注册依赖 curl_cffi/requests；Turnstile 需要 YesCaptcha；邮箱使用 MoeMail)"
             ),
         )
     probe = getattr(reg_adapter, "registration_available", None)
@@ -590,7 +609,7 @@ def _require_register_adapter():
             raise HTTPException(
                 status_code=503,
                 detail=st.get("error")
-                or "注册组件不可用，请安装 DrissionPage/chromium/xvfb 并配置 MoeMail",
+                or "注册组件不可用，请检查 grok-build-auth 与 YesCaptcha/MoeMail 配置",
             )
     return reg_adapter
 
@@ -601,7 +620,10 @@ async def start_email_registration(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Start browser registration (509992828/grok-register) + MoeMail + SSO import."""
+    """Start protocol registration (grok-build-auth) + MoeMail + SSO import.
+
+    Supports multi-thread batch via count/concurrency/stagger_ms.
+    """
     require_admin(request, x_admin_token)
     adapter = _require_register_adapter()
     try:
@@ -611,9 +633,14 @@ async def start_email_registration(
             moemail_base_url=body.base_url,
             prefix=body.prefix,
             domain=body.domain,
+            expiry_ms=body.expiry_ms,
             yescaptcha_key=body.yescaptcha_key,
+            count=body.count,
+            concurrency=body.concurrency,
+            stagger_ms=body.stagger_ms,
         )
     except TypeError:
+        # Older adapter without batch kwargs.
         try:
             result = adapter.start_registration(
                 proxy=body.proxy,
@@ -621,6 +648,7 @@ async def start_email_registration(
                 moemail_base_url=body.base_url,
                 prefix=body.prefix,
                 domain=body.domain,
+                yescaptcha_key=body.yescaptcha_key,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -638,7 +666,13 @@ async def test_email_registration_proxy(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return {"ok": True, "message": "proxy test placeholder"}
+    from moemail import test_xai_proxy
+
+    return test_xai_proxy(
+        proxy=body.proxy,
+        proxy_username=body.proxy_username,
+        proxy_password=body.proxy_password,
+    )
 
 
 @router.post("/register-email/test-proxy")
@@ -648,7 +682,13 @@ async def test_email_registration_proxy_unscoped(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return {"ok": True, "message": "proxy test placeholder"}
+    from moemail import test_xai_proxy
+
+    return test_xai_proxy(
+        proxy=body.proxy,
+        proxy_username=body.proxy_username,
+        proxy_password=body.proxy_password,
+    )
 
 
 @router.get("/accounts/register-email/sessions")
@@ -665,10 +705,28 @@ async def list_email_registration_sessions(
         if isinstance(out, dict):
             out["adapter_build"] = st.get("adapter_build")
             out["available"] = st.get("available")
-            out["engine"] = st.get("engine")
+            out["engine"] = st.get("engine") or "dongguatanglinux/grok-build-auth"
+            out["yescaptcha_configured"] = st.get("yescaptcha_configured")
     except Exception:
         pass
     return out
+
+
+@router.get("/accounts/register-email/batches/{batch_id}")
+async def get_email_registration_batch(
+    batch_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    getter = getattr(adapter, "get_registration_batch", None)
+    if not callable(getter):
+        raise HTTPException(status_code=404, detail="batch API not available")
+    result = getter(batch_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="registration batch not found")
+    return result
 
 
 @router.get("/accounts/register-email/sessions/{session_id}")
@@ -785,6 +843,27 @@ async def delete_account(
     if not accounts.remove_account(account_id):
         raise HTTPException(status_code=404, detail="Account not found")
     return {"ok": True}
+
+
+class AccountBulkDeleteBody(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=2000)
+
+
+@router.post("/accounts/delete-batch")
+async def delete_accounts_batch(
+    body: AccountBulkDeleteBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Delete multiple accounts from auth.json in one request."""
+    require_admin(request, x_admin_token)
+    ids = [str(x).strip() for x in (body.ids or []) if str(x).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    if len(ids) > 2000:
+        raise HTTPException(status_code=400, detail="too many ids (max 2000)")
+    result = accounts.remove_accounts(ids)
+    return {"ok": True, **result}
 
 
 @router.patch("/accounts/{account_id:path}/enabled")

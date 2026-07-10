@@ -1,4 +1,4 @@
-# grokcli-2api — self-contained image (vendored grok-register browser engine)
+# grokcli-2api — self-contained image (vendored grok-build-auth protocol engine)
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -7,26 +7,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GROK2API_HOST=0.0.0.0 \
     GROK2API_PORT=3000 \
     GROK2API_OPEN_BROWSER=0 \
-    PYTHONPATH=/app/vendors/grok-register \
-    GROK_REGISTER_HEADLESS=1 \
-    GROK_REGISTER_BROWSER_PATH=/usr/bin/chromium \
-    CHROME_PATH=/usr/bin/chromium \
-    CHROMIUM_PATH=/usr/bin/chromium
+    PYTHONPATH=/app/grok-build-auth
 
 WORKDIR /app
 
-# System deps: TLS + headless browser stack for grok-register
+# System deps: TLS only (protocol registration needs no browser)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        xvfb \
-        chromium \
-        chromium-driver \
-        fonts-liberation \
-        fonts-noto-cjk \
-    && rm -rf /var/lib/apt/lists/* \
-    && (test -x /usr/bin/chromium || test -x /usr/bin/chromium-browser || test -x /usr/bin/google-chrome)
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir -r /app/requirements.txt
@@ -35,9 +25,9 @@ RUN python -m pip install --no-cache-dir -r /app/requirements.txt
 COPY . /app
 
 # Ensure vendored registration packages are present
-RUN test -f /app/vendors/grok-register/DrissionPage_example.py \
-    && test -f /app/register_runner.py \
-    && python -c "import register_runner, app; print('build-check', app.APP_VERSION, register_runner.ADAPTER_BUILD)"
+RUN test -f /app/grok-build-auth/xconsole_client/client.py \
+    && test -f /app/grok_build_adapter.py \
+    && python -c "import grok_build_adapter, app; print('build-check', app.APP_VERSION, grok_build_adapter.ADAPTER_BUILD)"
 
 EXPOSE 3000
 

@@ -40,6 +40,8 @@ from config import (
     FORCE_UPSTREAM_STREAM,
     HOST,
     PORT,
+    REASONING_COMPAT,
+    SSE_KEEPALIVE_INTERVAL,
     STATIC_DIR,
     TIMEOUT,
     UPSTREAM_BASE,
@@ -47,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.8.4"
 
 
 def _on_startup() -> None:
@@ -102,15 +104,16 @@ def _on_startup() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"  (model health failed: {e})")
     # Registration engine is optional — never block API startup.
-    # Engine: 509992828/grok-register + MoeMail + sso_to_auth_json.
+    # Engine: dongguatanglinux/grok-build-auth (HTTP protocol) + MoeMail + sso_to_auth_json.
     try:
-        import register_runner as _reg
+        import grok_build_adapter as _reg
 
         st = _reg.registration_available()
         if st.get("available"):
             print(
                 "  registration: ready "
-                f"(engine={st.get('engine')} build={st.get('adapter_build')})"
+                f"(engine={st.get('engine') or 'grok-build-auth'} "
+                f"build={st.get('adapter_build')})"
             )
         else:
             print(
@@ -380,9 +383,67 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     for k, v in optional.items():
         if v is not None:
             body[k] = v
+    # cli-chat-proxy / grok-4.5 rejects several OpenAI sampling knobs that
+    # new-api playground enables by default (presence/frequency_penalty, etc.).
+    # Strip unsupported fields so secondary relays don't surface empty streams.
+    _sanitize_upstream_body(body, model=model)
     # Secondary relays (newapi/sub2api) rely on final stream usage for billing.
     _ensure_stream_include_usage(body)
     return body
+
+
+# Parameters known to be rejected by cli-chat-proxy for current Grok Build models.
+# Keep this list conservative: only drop fields that upstream 400s on.
+_UPSTREAM_UNSUPPORTED_PARAMS = frozenset(
+    {
+        "presence_penalty",
+        "frequency_penalty",
+        # Some builds also reject these OpenAI extras when forwarded blindly.
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "n",
+    }
+)
+
+
+def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -> None:
+    """Drop/clamp fields that cli-chat-proxy rejects for Grok models."""
+    # Always drop known-unsupported OpenAI knobs for this upstream.
+    for key in list(body.keys()):
+        if key in _UPSTREAM_UNSUPPORTED_PARAMS:
+            body.pop(key, None)
+
+    # n>1 is unsupported; force single completion.
+    if body.get("n") not in (None, 1):
+        body["n"] = 1
+
+    # Zero penalties are still rejected by name, so already removed above.
+    # Clamp temperature/top_p to sane ranges if present.
+    if "temperature" in body:
+        try:
+            t = float(body["temperature"])
+            body["temperature"] = max(0.0, min(2.0, t))
+        except (TypeError, ValueError):
+            body.pop("temperature", None)
+    if "top_p" in body:
+        try:
+            p = float(body["top_p"])
+            body["top_p"] = max(0.0, min(1.0, p))
+        except (TypeError, ValueError):
+            body.pop("top_p", None)
+
+    # max_tokens=0 / negative is invalid for many clients and upstreams.
+    for mk in ("max_tokens", "max_completion_tokens"):
+        if mk in body:
+            try:
+                if int(body[mk]) < 1:
+                    body.pop(mk, None)
+            except (TypeError, ValueError):
+                body.pop(mk, None)
+
+    # new-api playground may inject non-OpenAI fields (e.g. group) via extra="allow".
+    body.pop("group", None)
 
 
 def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
@@ -539,7 +600,7 @@ def _usage_from_body_and_output(
 async def _aiter_sse_lines_with_keepalive(
     resp: httpx.Response,
     *,
-    keepalive_interval: float = 15.0,
+    keepalive_interval: float | None = None,
 ) -> AsyncIterator[str | None]:
     """
     Yield SSE lines from upstream; yield None on keepalive ticks.
@@ -547,6 +608,8 @@ async def _aiter_sse_lines_with_keepalive(
     Secondary relays (newapi etc.) often idle-timeout long thinking gaps.
     None means the caller should emit an SSE comment / ping.
     """
+    if keepalive_interval is None:
+        keepalive_interval = max(2.0, float(SSE_KEEPALIVE_INTERVAL or 8.0))
     aiter = resp.aiter_lines()
     pending: asyncio.Future[str] | None = asyncio.ensure_future(aiter.__anext__())
     try:
@@ -614,9 +677,11 @@ def _sse_chunk(
         delta: dict[str, Any] = {}
         if role is not None:
             delta["role"] = role
-        if content is not None:
+        # Never emit empty content strings — some relays treat "" as a real token
+        # and playground UIs may lock/clear the output pane on empty deltas.
+        if content is not None and content != "":
             delta["content"] = content
-        if reasoning is not None:
+        if reasoning is not None and reasoning != "":
             delta["reasoning_content"] = reasoning
         if tool_calls is not None:
             delta["tool_calls"] = tool_calls
@@ -633,6 +698,69 @@ def _sse_chunk(
     if usage is not None:
         payload["usage"] = usage
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+class _ReasoningCompatState:
+    """Track <think> open/close when rewriting reasoning for secondary relays."""
+
+    def __init__(self, mode: str | None = None) -> None:
+        self.mode = (mode or REASONING_COMPAT or "off").strip().lower()
+        if self.mode in ("1", "true", "yes", "on"):
+            self.mode = "think_tag"
+        if self.mode not in ("off", "think_tag", "content", "none", ""):
+            self.mode = "think_tag"
+        if self.mode in ("none", ""):
+            self.mode = "off"
+        self.think_open = False
+        self.saw_reasoning = False
+        self.closed = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in ("think_tag", "content")
+
+    def rewrite(
+        self, content: str | None, reasoning: str | None
+    ) -> tuple[str | None, str | None]:
+        """Return (content, reasoning) after compatibility rewrite."""
+        if not self.enabled:
+            return content, reasoning
+
+        c = content if content else None
+        r = reasoning if reasoning else None
+        if not r and not c:
+            return c, None
+
+        pieces: list[str] = []
+        if r:
+            self.saw_reasoning = True
+            if self.mode == "think_tag":
+                if not self.think_open:
+                    pieces.append("<think>\n")
+                    self.think_open = True
+                pieces.append(r)
+            else:
+                # plain content merge
+                pieces.append(r)
+
+        if c:
+            if self.mode == "think_tag" and self.think_open and not self.closed:
+                pieces.append("\n</think>\n")
+                self.think_open = False
+                self.closed = True
+            pieces.append(c)
+
+        out = "".join(pieces) if pieces else None
+        # When rewriting into content, suppress separate reasoning_content to
+        # avoid double-rendering in new-api playground / Claude UIs.
+        return out, None
+
+    def close_tag_chunk(self) -> str | None:
+        if self.mode == "think_tag" and self.think_open and not self.closed:
+            self.think_open = False
+            self.closed = True
+            return "\n</think>\n"
+        return None
 
 
 def _sse_keepalive() -> str:
@@ -885,7 +1013,7 @@ def _normalize_stream_finish_reason(
 async def health():
     reg: dict[str, Any] = {"available": False}
     try:
-        import register_runner as _reg
+        import grok_build_adapter as _reg
 
         reg = _reg.registration_available()
     except Exception as e:  # noqa: BLE001
@@ -1173,9 +1301,11 @@ async def _stream_proxy_with_failover(
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_acc: dict[int, dict[str, Any]] = {}
+        reasoning_compat = _ReasoningCompatState()
         try:
             async with httpx.AsyncClient(
-                timeout=httpx.Timeout(TIMEOUT, connect=30.0)
+                timeout=httpx.Timeout(TIMEOUT, connect=30.0),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
             ) as client:
                 async with client.stream(
                     "POST", url, headers=headers, json=body
@@ -1219,12 +1349,12 @@ async def _stream_proxy_with_failover(
                             )
 
                     if not role_sent:
+                        # Role-only delta (no empty content) — required for new-api playground.
                         yield _sse_chunk(
                             chat_id=chat_id,
                             model=model,
                             created=created,
                             role="assistant",
-                            content="",
                         )
                         role_sent = True
 
@@ -1233,7 +1363,6 @@ async def _stream_proxy_with_failover(
                         async for line in _aiter_sse_lines_with_keepalive(resp):
                             # Soft disconnect check: keep draining so we can still
                             # emit a terminal finish/tool_calls frame when possible.
-                            # Hard-abort only after repeated disconnect signals.
                             try:
                                 if await client_disconnected():
                                     client_gone = True
@@ -1276,26 +1405,55 @@ async def _stream_proxy_with_failover(
                             if tool_calls:
                                 saw_tool_calls = True
                                 _merge_tool_call_delta(tool_acc, tool_calls)
-                            if content or reasoning or tool_calls or finish:
+
+                            emit_content, emit_reasoning = reasoning_compat.rewrite(
+                                content if content else None,
+                                reasoning if reasoning else None,
+                            )
+
+                            if (
+                                emit_content
+                                or emit_reasoning
+                                or tool_calls
+                                or finish
+                            ):
                                 stream_started = True
                                 if finish:
                                     finished = True
                                     held_finish = finish
-                                # Always normalize tool finish; many upstreams
-                                # emit finish_reason=stop even with tool_calls.
-                                emit_finish = _normalize_stream_finish_reason(
-                                    finish, saw_tool_calls=saw_tool_calls
-                                ) if finish else None
+                                # Close <think> before finish if still open.
+                                if finish and not client_gone:
+                                    close_tag = reasoning_compat.close_tag_chunk()
+                                    if close_tag:
+                                        yield _sse_chunk(
+                                            chat_id=chat_id,
+                                            model=model,
+                                            created=created,
+                                            content=close_tag,
+                                        )
+                                emit_finish = (
+                                    _normalize_stream_finish_reason(
+                                        finish, saw_tool_calls=saw_tool_calls
+                                    )
+                                    if finish
+                                    else None
+                                )
                                 if client_gone:
-                                    # Client already left — still accumulate so
-                                    # we can log/finish cleanly, but stop yielding.
+                                    continue
+                                # Skip completely empty deltas (no content/reasoning/tools/finish)
+                                if not (
+                                    emit_content
+                                    or emit_reasoning
+                                    or tool_calls
+                                    or emit_finish
+                                ):
                                     continue
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
-                                    content=content if content else None,
-                                    reasoning=reasoning if reasoning else None,
+                                    content=emit_content,
+                                    reasoning=emit_reasoning,
                                     tool_calls=tool_calls,
                                     finish_reason=emit_finish,
                                 )
@@ -1362,22 +1520,28 @@ async def _stream_proxy_with_failover(
                             if reasoning:
                                 reasoning_parts.append(reasoning)
                             stream_started = True
-                            if content:
+                            emit_content, emit_reasoning = reasoning_compat.rewrite(
+                                content if content else None,
+                                reasoning if reasoning else None,
+                            )
+                            close_tag = reasoning_compat.close_tag_chunk()
+                            if close_tag:
+                                emit_content = (emit_content or "") + close_tag
+                            if emit_content:
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
-                                    content=content,
+                                    content=emit_content,
                                 )
-                            if reasoning:
+                            if emit_reasoning and not reasoning_compat.enabled:
                                 yield _sse_chunk(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
-                                    reasoning=reasoning,
+                                    reasoning=emit_reasoning,
                                 )
                             if emit_tc:
-                                # emit as OpenAI-style indexed deltas
                                 indexed: list[Any] = []
                                 for i, tc in enumerate(emit_tc):
                                     if isinstance(tc, dict):
@@ -1408,6 +1572,15 @@ async def _stream_proxy_with_failover(
                 held_finish if finished else None,
                 saw_tool_calls=saw_tool_calls,
             ) or ("tool_calls" if saw_tool_calls else "stop")
+            if not client_gone:
+                close_tag = reasoning_compat.close_tag_chunk()
+                if close_tag:
+                    yield _sse_chunk(
+                        chat_id=chat_id,
+                        model=model,
+                        created=created,
+                        content=close_tag,
+                    )
             if not finished and not client_gone:
                 yield _sse_chunk(
                     chat_id=chat_id,
@@ -1426,6 +1599,8 @@ async def _stream_proxy_with_failover(
                         finish_reason="tool_calls",
                     )
             # OpenAI-compatible final usage chunk (empty choices) for sub2api/newapi
+            # Prefer real completion tokens from streamed content+reasoning; many
+            # relays mark empty completion_tokens as a failed playground turn.
             norm_usage = _usage_from_body_and_output(
                 body,
                 content="".join(content_parts),

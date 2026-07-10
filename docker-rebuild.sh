@@ -12,14 +12,15 @@ echo "== local fingerprint =="
 python3 - <<'PY' || python - <<'PY'
 from pathlib import Path
 import re
-runner = Path('register_runner.py').read_text(encoding='utf-8')
+adapter = Path('grok_build_adapter.py').read_text(encoding='utf-8')
 app = Path('app.py').read_text(encoding='utf-8')
-m1 = re.search(r'ADAPTER_BUILD\s*=\s*"([^"]+)"', runner)
+m1 = re.search(r'ADAPTER_BUILD\s*=\s*"([^"]+)"', adapter)
 m2 = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', app)
 print('ADAPTER_BUILD=', m1.group(1) if m1 else None)
 print('APP_VERSION=', m2.group(1) if m2 else None)
-print('legacy_adapter_present=', Path('grok_build_adapter.py').exists())
-print('legacy_dir_present=', Path('grok-build-auth').exists())
+print('adapter_present=', Path('grok_build_adapter.py').exists())
+print('engine_dir_present=', Path('grok-build-auth/xconsole_client').exists())
+print('browser_runner_present=', Path('register_runner.py').exists())
 PY
 
 echo "== docker stop/remove =="
@@ -40,4 +41,4 @@ docker compose logs --tail=60
 echo "== health =="
 curl -sS "http://127.0.0.1:3000/health" || true
 echo
-echo "Done. /health should show version=1.7.0 and registration.engine=509992828/grok-register"
+echo "Done. /health should show version=1.8.0 and registration.engine=dongguatanglinux/grok-build-auth"

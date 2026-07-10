@@ -12,14 +12,14 @@ if ($LASTEXITCODE -ne 0) {
     python -m pip install -r requirements.txt
 }
 
-python -c "import curl_cffi, requests, DrissionPage" 2>$null
+python -c "import curl_cffi, requests" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Installing remaining dependencies..."
     python -m pip install -r requirements.txt
 }
 
-# Vendored grok-register package path
-$env:PYTHONPATH = (Join-Path $PSScriptRoot "vendors\grok-register") + (
+# Vendored grok-build-auth package path
+$env:PYTHONPATH = (Join-Path $PSScriptRoot "grok-build-auth") + (
     if ($env:PYTHONPATH) { ";" + $env:PYTHONPATH } else { "" }
 )
 
@@ -30,6 +30,7 @@ if (-not $env:GROK2API_PORT) { $env:GROK2API_PORT = "3000" }
 $port = $env:GROK2API_PORT
 Write-Host "Starting grokcli-2api..."
 Write-Host "  Admin: http://127.0.0.1:$port/admin"
+Write-Host "  Registration: grok-build-auth (HTTP protocol)"
 Write-Host "  (browser opens automatically unless GROK2API_OPEN_BROWSER=0)"
 
 python app.py
@@ -38,7 +39,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] service exited with code $LASTEXITCODE"
     Write-Host "Common fixes:"
     Write-Host "  1) python -m pip install -r requirements.txt"
-    Write-Host "  2) ensure vendors\grok-register exists"
-    Write-Host "  3) browser registration needs chromium/chrome + xvfb"
+    Write-Host "  2) ensure grok-build-auth exists"
+    Write-Host "  3) protocol registration needs YesCaptcha + MoeMail"
     exit $LASTEXITCODE
 }
