@@ -174,7 +174,11 @@ def _worker() -> None:
 
 def start_background() -> None:
     global _thread
-    if os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower() in ("0", "false", "no"):
+    try:
+        from config import TOKEN_MAINTAIN
+    except Exception:
+        TOKEN_MAINTAIN = True
+    if not TOKEN_MAINTAIN:
         return
     if _thread and _thread.is_alive():
         return
@@ -191,14 +195,14 @@ def stop_background() -> None:
 def status() -> dict[str, Any]:
     rem = _min_remaining_seconds()
     try:
-        from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS
+        from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS, TOKEN_MAINTAIN
     except Exception:
         TOKEN_REFRESH_BATCH = 40
         TOKEN_REFRESH_WORKERS = 4
+        TOKEN_MAINTAIN = True
     return {
         "running": bool(_thread and _thread.is_alive()),
-        "enabled": os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower()
-        not in ("0", "false", "no"),
+        "enabled": bool(TOKEN_MAINTAIN),
         "interval_sec": _interval(),
         "next_wait_sec": _next_wait_seconds(),
         "refresh_skew_sec": _skew(),

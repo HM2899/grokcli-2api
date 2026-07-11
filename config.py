@@ -118,6 +118,35 @@ MODEL_HEALTH_STARTUP_DELAY = _env_float(
 TOKEN_REFRESH_BATCH = _env_int("GROK2API_TOKEN_REFRESH_BATCH", 40, maximum=500)
 MODEL_PROBE_BATCH = _env_int("GROK2API_MODEL_PROBE_BATCH", 40, maximum=500)
 
+# Background worker master switches (centralised here so other modules don't
+# re-parse os.getenv). Background threads no longer run on the event loop,
+# so these can safely default to enabled even in single-worker deployments.
+TOKEN_MAINTAIN = os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+MODEL_HEALTH = os.getenv("GROK2API_MODEL_HEALTH", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+# Admin / bulk operation timeouts (seconds). These bound synchronous work that
+# is offloaded to threads so a stuck OIDC/network call cannot hang a request.
+ADMIN_SYNC_TIMEOUT = float(os.getenv("GROK2API_ADMIN_SYNC_TIMEOUT", "60.0"))
+ADMIN_BULK_TIMEOUT = float(os.getenv("GROK2API_ADMIN_BULK_TIMEOUT", "300.0"))
+OIDC_NETWORK_TIMEOUT = float(os.getenv("GROK2API_OIDC_NETWORK_TIMEOUT", "60.0"))
+
+# Heavy admin endpoints (refresh-all, probe-all, quota-all, SSO-import) return a
+# job_id immediately and run in the background. Set to 0/false/no for legacy
+# synchronous responses.
+ADMIN_BULK_ASYNC = os.getenv("GROK2API_ADMIN_BULK_ASYNC", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
 # xAI OIDC (public client — device code + refresh; no local CLI binary)
 GROK_CLI_CLIENT_ID = os.getenv(
     "GROK2API_OIDC_CLIENT_ID",

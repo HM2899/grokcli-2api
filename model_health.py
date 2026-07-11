@@ -564,7 +564,11 @@ def _worker() -> None:
 
 def start_background() -> None:
     global _thread
-    if os.getenv("GROK2API_MODEL_HEALTH", "1").lower() in ("0", "false", "no"):
+    try:
+        from config import MODEL_HEALTH
+    except Exception:
+        MODEL_HEALTH = True
+    if not MODEL_HEALTH:
         return
     if _thread and _thread.is_alive():
         return
@@ -582,10 +586,13 @@ def stop_background() -> None:
 
 def status() -> dict[str, Any]:
     interval = _interval()
+    try:
+        from config import MODEL_HEALTH
+    except Exception:
+        MODEL_HEALTH = True
     return {
         "running": bool(_thread and _thread.is_alive()),
-        "enabled": os.getenv("GROK2API_MODEL_HEALTH", "1").lower()
-        not in ("0", "false", "no"),
+        "enabled": bool(MODEL_HEALTH),
         "interval_sec": interval,
         "startup_delay_sec": _startup_delay(),
         "probe_workers": MODEL_PROBE_WORKERS,

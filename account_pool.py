@@ -5,6 +5,7 @@ All accounts are equal — there is no primary/preferred account.
 
 from __future__ import annotations
 
+import asyncio
 import random
 import threading
 import time
@@ -83,10 +84,16 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
 
 
 def list_pool_accounts() -> list[dict[str, Any]]:
-    """Live credentials merged with pool metadata (for admin UI)."""
+    """Live credentials merged with pool metadata (for admin UI).
+
+    Listing/status calls must never perform OIDC network refreshes: on a large
+    account pool a single expired token used to synchronously block Uvicorn for
+    tens of seconds. Token renewal belongs to the explicit maintenance task or
+    request-time account selection, not admin/health reads.
+    """
     state = get_account_pool_state()
     out: list[dict[str, Any]] = []
-    for creds in list_live_credentials(include_expired=True):
+    for creds in list_live_credentials(include_expired=True, auto_refresh=False):
         meta = _pool_meta(creds.auth_key or "", state)
         out.append(
             {
@@ -181,6 +188,7 @@ def acquire(
     exclude: set[str] | None = None,
     *,
     model: str | None = None,
+    auto_refresh: bool = True,
 ) -> GrokCredentials:
     """
     Select next account according to configured mode.
@@ -195,7 +203,9 @@ def acquire(
 
     _ensure_multi_account_layout()
 
-    all_live = list_live_credentials(include_expired=False, auto_refresh=True)
+    # Request paths may opt in to a tiny on-demand renewal. Read-only routes
+    # pass False so an expired account cannot block the event loop on OIDC.
+    all_live = list_live_credentials(include_expired=False, auto_refresh=auto_refresh)
     if not all_live:
         raise AuthError(
             "No live accounts in auth store. "
@@ -565,3 +575,28 @@ def try_acquire_sequence(
 
 def load_for_id(account_id: str) -> GrokCredentials:
     return load_credentials_by_id(account_id)
+
+
+async def acquire_async(
+    exclude: set[str] | None = None,
+    *,
+    model: str | None = None,
+    auto_refresh: bool = True,
+) -> GrokCredentials:
+    """Event-loop-friendly wrapper for account selection."""
+    return await asyncio.to_thread(acquire, exclude, model=model, auto_refresh=auto_refresh)
+
+
+async def try_acquire_sequence_async(
+    max_attempts: int | None = None,
+    *,
+    model: str | None = None,
+    prefer_account_id: str | None = None,
+) -> list[GrokCredentials]:
+    """Event-loop-friendly wrapper for failover chain building."""
+    return await asyncio.to_thread(
+        try_acquire_sequence,
+        max_attempts,
+        model=model,
+        prefer_account_id=prefer_account_id,
+    )

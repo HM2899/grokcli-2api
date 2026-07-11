@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
@@ -18,7 +19,7 @@ import conversation_affinity
 import model_health
 import quota
 import token_maintainer
-from auth import AuthError, load_credentials
+from auth import AuthError, load_credentials, load_credentials_by_id
 import config as _config
 import sso_to_auth_json as sso_import
 
@@ -31,10 +32,15 @@ except Exception as _reg_import_err:  # noqa: BLE001
 else:
     _REG_IMPORT_ERROR = None
 from config import (
+    ADMIN_BULK_ASYNC,
+    ADMIN_BULK_TIMEOUT,
+    ADMIN_SYNC_TIMEOUT,
     CLI_VERSION,
     DEFAULT_MODEL,
+    OIDC_NETWORK_TIMEOUT,
     PUBLIC_BASE_URL,
     REQUIRE_API_KEY,
+    SSO_IMPORT_WORKERS,
     UPSTREAM_BASE,
 )
 from models import load_models_from_cache, resolve_model, sync_models_from_upstream
@@ -52,6 +58,131 @@ from settings_store import (
 )
 
 router = APIRouter(prefix="/admin/api", tags=["admin"])
+
+# In-memory ephemeral job tracker for heavy admin bulk operations.
+# Jobs disappear on process restart; this is acceptable for admin utilities.
+_jobs: dict[str, dict[str, Any]] = {}
+_job_counter = 0
+_bulk_semaphore = asyncio.Semaphore(2)
+
+
+def _new_job_id(name: str) -> str:
+    global _job_counter
+    _job_counter += 1
+    return f"{name}-{int(time.time())}-{_job_counter}"
+
+
+async def _run_bulk_sync(
+    name: str,
+    func: Callable[..., Any],
+    *args: Any,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Run a synchronous bulk function off the event loop.
+
+    When ADMIN_BULK_ASYNC is enabled (default), returns a job immediately and
+    executes the work in a background task so the Uvicorn event loop stays
+    responsive. Otherwise awaits the threaded result synchronously (legacy).
+    """
+    if not ADMIN_BULK_ASYNC:
+        return await asyncio.wait_for(
+            asyncio.to_thread(func, *args), timeout=timeout
+        )
+
+    job_id = _new_job_id(name)
+    _jobs[job_id] = {
+        "id": job_id,
+        "name": name,
+        "status": "running",
+        "started_at": time.time(),
+        "result": None,
+        "error": None,
+    }
+
+    async def _task() -> None:
+        async with _bulk_semaphore:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(func, *args), timeout=timeout
+                )
+                _jobs[job_id].update(
+                    {"status": "done", "finished_at": time.time(), "result": result}
+                )
+            except asyncio.TimeoutError:
+                _jobs[job_id].update(
+                    {
+                        "status": "timeout",
+                        "finished_at": time.time(),
+                        "error": "timeout",
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                _jobs[job_id].update(
+                    {"status": "error", "finished_at": time.time(), "error": str(e)}
+                )
+
+    asyncio.create_task(_task())
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "check": f"/admin/api/jobs/{job_id}",
+    }
+
+
+async def _run_bulk_coro(
+    name: str,
+    coro_factory: Callable[[], Any],
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Run an async bulk coroutine (that already uses threads internally) as a job."""
+    if not ADMIN_BULK_ASYNC:
+        return await asyncio.wait_for(coro_factory(), timeout=timeout)
+
+    job_id = _new_job_id(name)
+    _jobs[job_id] = {
+        "id": job_id,
+        "name": name,
+        "status": "running",
+        "started_at": time.time(),
+        "result": None,
+        "error": None,
+    }
+
+    async def _task() -> None:
+        async with _bulk_semaphore:
+            try:
+                result = await asyncio.wait_for(coro_factory(), timeout=timeout)
+                _jobs[job_id].update(
+                    {"status": "done", "finished_at": time.time(), "result": result}
+                )
+            except asyncio.TimeoutError:
+                _jobs[job_id].update(
+                    {
+                        "status": "timeout",
+                        "finished_at": time.time(),
+                        "error": "timeout",
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                _jobs[job_id].update(
+                    {"status": "error", "finished_at": time.time(), "error": str(e)}
+                )
+
+    asyncio.create_task(_task())
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "check": f"/admin/api/jobs/{job_id}",
+    }
+
+
+async def _run_sync(
+    func: Callable[..., Any],
+    *args: Any,
+    timeout: float | None = ADMIN_SYNC_TIMEOUT,
+) -> Any:
+    """Run a synchronous function off the event loop with an explicit timeout."""
+    return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
 
 
 # ── request bodies ──────────────────────────────────────────────────────────
@@ -275,18 +406,29 @@ def _public_api_base(request: Request | None = None) -> str:
 
 @router.get("/status")
 async def admin_status(request: Request):
-    setup = is_setup_needed()
-    account = accounts.account_status()
-    key_stats = apikeys.stats()
-    pool = account_pool.pool_summary()
-    creds_ok = False
-    creds_email = None
-    try:
-        c = load_credentials()
-        creds_ok = True
-        creds_email = c.email
-    except AuthError:
-        pass
+    def _gather():
+        setup = is_setup_needed()
+        account = accounts.account_status()
+        key_stats = apikeys.stats()
+        pool = account_pool.pool_summary()
+        creds_ok = False
+        creds_email = None
+        try:
+            c = load_credentials()
+            creds_ok = True
+            creds_email = c.email
+        except AuthError:
+            pass
+        return setup, account, key_stats, pool, creds_ok, creds_email
+
+    (
+        setup,
+        account,
+        key_stats,
+        pool,
+        creds_ok,
+        creds_email,
+    ) = await _run_sync(_gather, timeout=ADMIN_SYNC_TIMEOUT)
 
     host = _config.HOST
     port = _config.PORT
@@ -346,7 +488,7 @@ async def admin_setup(body: SetupBody):
     if not is_setup_needed():
         raise HTTPException(status_code=400, detail="Already set up")
     try:
-        set_admin_password(body.password)
+        await _run_sync(set_admin_password, body.password, timeout=ADMIN_SYNC_TIMEOUT)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     token = create_session_token()
@@ -357,7 +499,10 @@ async def admin_setup(body: SetupBody):
 async def admin_login(body: LoginBody):
     if is_setup_needed():
         raise HTTPException(status_code=400, detail="Setup required first")
-    if not verify_admin_password(body.password):
+    ok = await _run_sync(
+        verify_admin_password, body.password, timeout=ADMIN_SYNC_TIMEOUT
+    )
+    if not ok:
         raise HTTPException(status_code=401, detail="Invalid password")
     token = create_session_token()
     return {"ok": True, "token": token}
@@ -369,7 +514,7 @@ async def admin_logout(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     token = _extract_session(request, x_admin_token)
-    revoke_session(token)
+    await _run_sync(revoke_session, token, timeout=ADMIN_SYNC_TIMEOUT)
     return {"ok": True}
 
 
@@ -382,20 +527,27 @@ async def dashboard(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    account = accounts.account_status()
-    key_stats = apikeys.stats()
-    pool = account_pool.pool_summary()
-    try:
-        c = load_credentials()
-        cred = {
-            "email": c.email,
-            "user_id": c.user_id,
-            "expires_at": c.expires_at,
-            "auth_key": c.auth_key,
-            "team_id": c.team_id,
-        }
-    except AuthError as e:
-        cred = {"error": str(e)}
+
+    def _gather():
+        account = accounts.account_status()
+        key_stats = apikeys.stats()
+        pool = account_pool.pool_summary()
+        try:
+            c = load_credentials()
+            cred = {
+                "email": c.email,
+                "user_id": c.user_id,
+                "expires_at": c.expires_at,
+                "auth_key": c.auth_key,
+                "team_id": c.team_id,
+            }
+        except AuthError as e:
+            cred = {"error": str(e)}
+        return account, key_stats, pool, cred
+
+    account, key_stats, pool, cred = await _run_sync(
+        _gather, timeout=ADMIN_SYNC_TIMEOUT
+    )
     host = _config.HOST
     port = _config.PORT
     public_origin = _request_public_origin(request)
@@ -427,7 +579,10 @@ async def list_keys(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return {"keys": apikeys.list_keys(), "stats": apikeys.stats()}
+    keys, stats = await _run_sync(
+        lambda: (apikeys.list_keys(), apikeys.stats()), timeout=ADMIN_SYNC_TIMEOUT
+    )
+    return {"keys": keys, "stats": stats}
 
 
 @router.post("/keys")
@@ -437,7 +592,9 @@ async def create_key(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    rec = apikeys.create_key(body.name, body.note)
+    rec = await _run_sync(
+        apikeys.create_key, body.name, body.note, timeout=ADMIN_SYNC_TIMEOUT
+    )
     return {"ok": True, "key": rec}
 
 
@@ -448,7 +605,9 @@ async def regenerate_key(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    rec = apikeys.regenerate_key(key_id)
+    rec = await _run_sync(
+        apikeys.regenerate_key, key_id, timeout=ADMIN_SYNC_TIMEOUT
+    )
     if not rec:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"ok": True, "key": rec}
@@ -462,22 +621,27 @@ async def update_key(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    rec = None
-    if body.enabled is not None:
-        rec = apikeys.set_enabled(key_id, body.enabled)
-        if not rec:
+
+    def _update():
+        rec = None
+        if body.enabled is not None:
+            rec = apikeys.set_enabled(key_id, body.enabled)
+            if not rec:
+                raise HTTPException(status_code=404, detail="Key not found")
+        if body.name is not None or body.note is not None:
+            rec = apikeys.update_key(key_id, name=body.name, note=body.note)
+            if not rec:
+                raise HTTPException(status_code=404, detail="Key not found")
+        if rec is None:
+            for k in apikeys.list_keys():
+                if k["id"] == key_id:
+                    rec = k
+                    break
+        if rec is None:
             raise HTTPException(status_code=404, detail="Key not found")
-    if body.name is not None or body.note is not None:
-        rec = apikeys.update_key(key_id, name=body.name, note=body.note)
-        if not rec:
-            raise HTTPException(status_code=404, detail="Key not found")
-    if rec is None:
-        for k in apikeys.list_keys():
-            if k["id"] == key_id:
-                rec = k
-                break
-    if rec is None:
-        raise HTTPException(status_code=404, detail="Key not found")
+        return rec
+
+    rec = await _run_sync(_update, timeout=ADMIN_SYNC_TIMEOUT)
     return {"ok": True, "key": rec}
 
 
@@ -488,7 +652,8 @@ async def delete_key(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    if not apikeys.delete_key(key_id):
+    ok = await _run_sync(apikeys.delete_key, key_id, timeout=ADMIN_SYNC_TIMEOUT)
+    if not ok:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"ok": True}
 
@@ -499,9 +664,13 @@ async def list_accounts_route(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    status = accounts.account_status()
-    status["pool"] = account_pool.pool_summary()
-    return status
+
+    def _gather():
+        status = accounts.account_status()
+        status["pool"] = account_pool.pool_summary()
+        return status
+
+    return await _run_sync(_gather, timeout=ADMIN_SYNC_TIMEOUT)
 
 
 @router.post("/accounts/login")
@@ -511,7 +680,9 @@ async def account_login(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return accounts.start_login(body.mode, capture=body.capture)
+    return await _run_sync(
+        accounts.start_login, body.mode, capture=body.capture, timeout=ADMIN_SYNC_TIMEOUT
+    )
 
 
 @router.get("/accounts/login/sessions")
@@ -544,7 +715,9 @@ async def import_account(
 ):
     """Import JWT / auth.json JSON body (API / script). Prefer file upload for UI."""
     require_admin(request, x_admin_token)
-    result = accounts.import_auth_payload(body.payload, merge=body.merge)
+    result = await _run_sync(
+        accounts.import_auth_payload, body.payload, merge=body.merge, timeout=ADMIN_SYNC_TIMEOUT
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "import failed")
     return result
@@ -587,11 +760,6 @@ async def import_sso(
     if not sso_cookies:
         raise HTTPException(status_code=400, detail="No valid SSO cookies provided")
 
-    results: list[dict[str, Any]] = []
-    imported: list[dict[str, Any]] = []
-    ok = 0
-    fail = 0
-
     def _import_one(args: tuple[int, str, str]) -> dict[str, Any]:
         i, email_hint, sso = args
         if body.delay > 0 and i > 1:
@@ -633,39 +801,44 @@ async def import_sso(
             item["error"] = str(e)
             return item
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def _run_sso_import() -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        imported: list[dict[str, Any]] = []
+        ok = 0
+        fail = 0
+        args = [(i, e, s) for i, (e, s) in enumerate(sso_items, 1)]
+        workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(args)))
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    try:
-        from config import SSO_IMPORT_WORKERS
-    except Exception:
-        SSO_IMPORT_WORKERS = 4
-    # Hard cap regardless of client-supplied max_workers (714×curl_cffi freezes WSL)
-    workers = min(int(body.max_workers), int(SSO_IMPORT_WORKERS), max(1, len(sso_items)))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
-        for fut in as_completed(ex.submit(_import_one, (i, e, s)) for i, (e, s) in enumerate(sso_items, 1)):
-            item = fut.result()
-            results.append(item)
-            if item.get("status") == "ok":
-                ok += 1
-                imported.append({
-                    "id": item.get("account_id"),
-                    "email": item.get("email"),
-                    "user_id": item.get("user_id"),
-                    "expires_at": item.get("expires_at"),
-                    "has_refresh_token": item.get("has_refresh_token"),
-                })
-            else:
-                fail += 1
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sso-import-") as ex:
+            for fut in as_completed(ex.submit(_import_one, a) for a in args):
+                item = fut.result()
+                results.append(item)
+                if item.get("status") == "ok":
+                    ok += 1
+                    imported.append({
+                        "id": item.get("account_id"),
+                        "email": item.get("email"),
+                        "user_id": item.get("user_id"),
+                        "expires_at": item.get("expires_at"),
+                        "has_refresh_token": item.get("has_refresh_token"),
+                    })
+                else:
+                    fail += 1
 
-    return {
-        "ok": fail == 0,
-        "message": f"SSO 导入完成：{ok} 成功, {fail} 失败",
-        "total": len(sso_cookies),
-        "success": ok,
-        "fail": fail,
-        "imported": imported,
-        "results": results,
-    }
+        return {
+            "ok": fail == 0,
+            "message": f"SSO 导入完成：{ok} 成功, {fail} 失败",
+            "total": len(sso_cookies),
+            "success": ok,
+            "fail": fail,
+            "imported": imported,
+            "results": results,
+        }
+
+    return await _run_bulk_sync(
+        "sso-import", _run_sso_import, timeout=ADMIN_BULK_TIMEOUT
+    )
 
 
 def _require_register_adapter():
@@ -703,34 +876,38 @@ async def start_email_registration(
     """
     require_admin(request, x_admin_token)
     adapter = _require_register_adapter()
-    try:
-        result = adapter.start_registration(
-            proxy=body.proxy,
-            moemail_api_key=body.api_key,
-            moemail_base_url=body.base_url,
-            prefix=body.prefix,
-            domain=body.domain,
-            expiry_ms=body.expiry_ms,
-            yescaptcha_key=body.yescaptcha_key,
-            count=body.count,
-            concurrency=body.concurrency,
-            stagger_ms=body.stagger_ms,
-        )
-    except TypeError:
-        # Older adapter without batch kwargs.
+
+    def _start():
         try:
-            result = adapter.start_registration(
+            return adapter.start_registration(
                 proxy=body.proxy,
                 moemail_api_key=body.api_key,
                 moemail_base_url=body.base_url,
                 prefix=body.prefix,
                 domain=body.domain,
+                expiry_ms=body.expiry_ms,
                 yescaptcha_key=body.yescaptcha_key,
+                count=body.count,
+                concurrency=body.concurrency,
+                stagger_ms=body.stagger_ms,
             )
+        except TypeError:
+            # Older adapter without batch kwargs.
+            try:
+                return adapter.start_registration(
+                    proxy=body.proxy,
+                    moemail_api_key=body.api_key,
+                    moemail_base_url=body.base_url,
+                    prefix=body.prefix,
+                    domain=body.domain,
+                    yescaptcha_key=body.yescaptcha_key,
+                )
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail=str(e)) from e
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    result = await _run_sync(_start, timeout=ADMIN_SYNC_TIMEOUT)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "start failed")
     return result
@@ -745,10 +922,12 @@ async def test_email_registration_proxy(
     require_admin(request, x_admin_token)
     from moemail import test_xai_proxy
 
-    return test_xai_proxy(
+    return await _run_sync(
+        test_xai_proxy,
         proxy=body.proxy,
         proxy_username=body.proxy_username,
         proxy_password=body.proxy_password,
+        timeout=ADMIN_SYNC_TIMEOUT,
     )
 
 
@@ -761,10 +940,12 @@ async def test_email_registration_proxy_unscoped(
     require_admin(request, x_admin_token)
     from moemail import test_xai_proxy
 
-    return test_xai_proxy(
+    return await _run_sync(
+        test_xai_proxy,
         proxy=body.proxy,
         proxy_username=body.proxy_username,
         proxy_password=body.proxy_password,
+        timeout=ADMIN_SYNC_TIMEOUT,
     )
 
 
@@ -776,17 +957,21 @@ async def list_email_registration_sessions(
     require_admin(request, x_admin_token)
     if reg_adapter is None:
         return {"sessions": [], "error": _REG_IMPORT_ERROR}
-    out = reg_adapter.list_registration_sessions()
-    try:
-        st = reg_adapter.registration_available()
-        if isinstance(out, dict):
-            out["adapter_build"] = st.get("adapter_build")
-            out["available"] = st.get("available")
-            out["engine"] = st.get("engine") or "dongguatanglinux/grok-build-auth"
-            out["yescaptcha_configured"] = st.get("yescaptcha_configured")
-    except Exception:
-        pass
-    return out
+
+    def _gather():
+        out = reg_adapter.list_registration_sessions()
+        try:
+            st = reg_adapter.registration_available()
+            if isinstance(out, dict):
+                out["adapter_build"] = st.get("adapter_build")
+                out["available"] = st.get("available")
+                out["engine"] = st.get("engine") or "dongguatanglinux/grok-build-auth"
+                out["yescaptcha_configured"] = st.get("yescaptcha_configured")
+        except Exception:
+            pass
+        return out
+
+    return await _run_sync(_gather, timeout=ADMIN_SYNC_TIMEOUT)
 
 
 @router.get("/accounts/register-email/batches/{batch_id}")
@@ -800,7 +985,7 @@ async def get_email_registration_batch(
     getter = getattr(adapter, "get_registration_batch", None)
     if not callable(getter):
         raise HTTPException(status_code=404, detail="batch API not available")
-    result = getter(batch_id)
+    result = await _run_sync(getter, batch_id, timeout=ADMIN_SYNC_TIMEOUT)
     if not result:
         raise HTTPException(status_code=404, detail="registration batch not found")
     return result
@@ -815,9 +1000,11 @@ async def get_email_registration_session(
 ):
     require_admin(request, x_admin_token)
     adapter = _require_register_adapter()
-    result = adapter.get_registration_session(
+    result = await _run_sync(
+        adapter.get_registration_session,
         session_id,
         include_auth_json=bool(include_auth_json),
+        timeout=ADMIN_SYNC_TIMEOUT,
     )
     if not result:
         raise HTTPException(status_code=404, detail="registration session not found")
@@ -858,7 +1045,11 @@ async def import_account_file(
             payload = text
         else:
             raise HTTPException(status_code=400, detail=f"invalid JSON: {e}") from e
-    result = accounts.import_auth_payload(payload, merge=merge_flag)
+
+    def _import():
+        return accounts.import_auth_payload(payload, merge=merge_flag)
+
+    result = await _run_sync(_import, timeout=ADMIN_SYNC_TIMEOUT)
     if not result.get("ok"):
         raise HTTPException(
             status_code=400, detail=result.get("error") or "import failed"
@@ -910,8 +1101,12 @@ async def export_accounts(
     download=1 → attachment; download=0 → JSON body.
     """
     require_admin(request, x_admin_token)
-    result = accounts.export_auth_payload(include_secrets=True)
-    return _export_response(result, download=bool(download))
+    result = await _run_sync(
+        accounts.export_auth_payload, include_secrets=True, timeout=ADMIN_SYNC_TIMEOUT
+    )
+    return await _run_sync(
+        _export_response, result, download=bool(download), timeout=ADMIN_SYNC_TIMEOUT
+    )
 
 
 @router.post("/accounts/export-batch")
@@ -928,16 +1123,20 @@ async def export_accounts_batch(
         raise HTTPException(status_code=400, detail="ids is required")
     if len(ids) > 2000:
         raise HTTPException(status_code=400, detail="too many ids (max 2000)")
-    result = accounts.export_auth_payload(
+    result = await _run_sync(
+        accounts.export_auth_payload,
         include_secrets=bool(body.include_secrets),
         account_ids=ids,
+        timeout=ADMIN_SYNC_TIMEOUT,
     )
     if not result.get("count"):
         raise HTTPException(status_code=404, detail="no matching accounts to export")
-    return _export_response(
+    return await _run_sync(
+        _export_response,
         result,
         download=bool(download),
         filename_prefix="grok2api-auth-export-selected",
+        timeout=ADMIN_SYNC_TIMEOUT,
     )
 
 
@@ -947,7 +1146,7 @@ async def account_logout(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    return accounts.run_logout()
+    return await _run_sync(accounts.run_logout, timeout=ADMIN_SYNC_TIMEOUT)
 
 
 @router.delete("/accounts/{account_id:path}")
@@ -957,7 +1156,8 @@ async def delete_account(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    if not accounts.remove_account(account_id):
+    ok = await _run_sync(accounts.remove_account, account_id, timeout=ADMIN_SYNC_TIMEOUT)
+    if not ok:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"ok": True}
 
@@ -979,7 +1179,7 @@ async def delete_accounts_batch(
         raise HTTPException(status_code=400, detail="ids is required")
     if len(ids) > 2000:
         raise HTTPException(status_code=400, detail="too many ids (max 2000)")
-    result = accounts.remove_accounts(ids)
+    result = await _run_sync(accounts.remove_accounts, ids, timeout=ADMIN_SYNC_TIMEOUT)
     return {"ok": True, **result}
 
 
@@ -991,10 +1191,14 @@ async def set_account_enabled_route(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
-    found = any(a["id"] == account_id for a in accounts.list_accounts())
-    if not found:
-        raise HTTPException(status_code=404, detail="Account not found")
-    rec = account_pool.set_account_enabled(account_id, body.enabled)
+
+    def _enable():
+        found = any(a["id"] == account_id for a in accounts.list_accounts())
+        if not found:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return account_pool.set_account_enabled(account_id, body.enabled)
+
+    rec = await _run_sync(_enable, timeout=ADMIN_SYNC_TIMEOUT)
     return {"ok": True, "account": rec}
 
 
@@ -1005,7 +1209,11 @@ async def list_accounts_quota(
 ):
     """Query billing quota for all accounts (cli-chat-proxy /v1/billing)."""
     require_admin(request, x_admin_token)
-    return await quota.fetch_all_quotas(include_expired=False)
+    return await _run_bulk_coro(
+        "quota-all",
+        lambda: quota.fetch_all_quotas(include_expired=False),
+        timeout=ADMIN_BULK_TIMEOUT,
+    )
 
 
 @router.post("/accounts/{account_id:path}/probe")
@@ -1019,15 +1227,20 @@ async def account_probe(
     require_admin(request, x_admin_token)
     model = resolve_model(body.model) if body.model else None
     try:
-        result = await asyncio.to_thread(
-            model_health.probe_single_account,
-            account_id,
-            model,
-            auto_disable=body.auto_disable,
-            source="manual",
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                model_health.probe_single_account,
+                account_id,
+                model,
+                auto_disable=body.auto_disable,
+                source="manual",
+            ),
+            timeout=ADMIN_SYNC_TIMEOUT,
         )
     except AuthError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except asyncio.TimeoutError as e:
+        raise HTTPException(status_code=504, detail="probe timed out") from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:400]) from e
     return result
@@ -1040,7 +1253,9 @@ async def accounts_probe_all(
 ):
     """Run model probe for every live account (same as background cycle)."""
     require_admin(request, x_admin_token)
-    return await asyncio.to_thread(model_health.run_once, source="manual_all")
+    return await _run_bulk_sync(
+        "probe-all", model_health.run_once, source="manual_all", timeout=ADMIN_BULK_TIMEOUT
+    )
 
 
 @router.get("/model-health")
@@ -1061,16 +1276,39 @@ async def account_quota(
     """Query billing quota for one account."""
     require_admin(request, x_admin_token)
     try:
-        from auth import load_credentials_by_id
-
-        creds = load_credentials_by_id(account_id)
+        creds = await asyncio.wait_for(
+            asyncio.to_thread(load_credentials_by_id, account_id),
+            timeout=ADMIN_SYNC_TIMEOUT,
+        )
     except AuthError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
-    result = await quota.fetch_quota_for_creds_async(creds)
+    except asyncio.TimeoutError as e:
+        raise HTTPException(status_code=504, detail="load credentials timed out") from e
+    try:
+        result = await asyncio.wait_for(
+            quota.fetch_quota_for_creds_async(creds),
+            timeout=ADMIN_SYNC_TIMEOUT,
+        )
+    except asyncio.TimeoutError as e:
+        raise HTTPException(status_code=504, detail="quota fetch timed out") from e
     if not result.get("ok"):
         # still return payload so UI can show the error
         return result
     return result
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(
+    job_id: str,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Status of an asynchronous admin bulk job."""
+    require_admin(request, x_admin_token)
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
 @router.put("/settings/account-mode")
@@ -1081,7 +1319,7 @@ async def set_mode(
 ):
     require_admin(request, x_admin_token)
     try:
-        mode = set_account_mode(body.mode)
+        mode = await _run_sync(set_account_mode, body.mode, timeout=ADMIN_SYNC_TIMEOUT)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {
@@ -1111,14 +1349,20 @@ async def refresh_accounts(
             raise HTTPException(status_code=400, detail="ids is empty")
         if len(ids) > 2000:
             raise HTTPException(status_code=400, detail="too many ids (max 2000)")
-    result = accounts.do_refresh_all(force=force, account_ids=ids)
-    # also kick background maintainer
-    try:
-        token_maintainer.request_run_soon()
-    except Exception:
-        pass
-    result["maintainer"] = token_maintainer.status()
-    return result
+
+    def _run():
+        result = accounts.do_refresh_all(force=force, account_ids=ids)
+        # also kick background maintainer
+        try:
+            token_maintainer.request_run_soon()
+        except Exception:
+            pass
+        result["maintainer"] = token_maintainer.status()
+        return result
+
+    return await _run_bulk_sync(
+        "refresh-accounts", _run, timeout=ADMIN_BULK_TIMEOUT
+    )
 
 
 @router.get("/maintainer")
@@ -1128,9 +1372,13 @@ async def maintainer_status(
 ):
     """Token auto-refresh worker status + current remaining lifetimes."""
     require_admin(request, x_admin_token)
-    st = token_maintainer.status()
-    st["accounts"] = accounts.list_accounts()
-    return st
+
+    def _gather():
+        st = token_maintainer.status()
+        st["accounts"] = accounts.list_accounts()
+        return st
+
+    return await _run_sync(_gather, timeout=ADMIN_SYNC_TIMEOUT)
 
 
 @router.post("/maintainer/run")
@@ -1142,8 +1390,9 @@ async def maintainer_run(
     """Run one maintenance cycle immediately (normalize + refresh)."""
     require_admin(request, x_admin_token)
     force = True if body is None else bool(body.force)
-    result = token_maintainer.run_once(force=force)
-    return result
+    return await _run_bulk_sync(
+        "maintainer", token_maintainer.run_once, force=force, timeout=ADMIN_BULK_TIMEOUT
+    )
 
 
 @router.post("/accounts/normalize")
@@ -1153,7 +1402,9 @@ async def normalize_accounts(
 ):
     """Re-key auth.json to per-user multi-account layout."""
     require_admin(request, x_admin_token)
-    return accounts.do_normalize_keys()
+    return await _run_sync(
+        accounts.do_normalize_keys, timeout=ADMIN_SYNC_TIMEOUT
+    )
 
 
 @router.get("/models")
@@ -1162,9 +1413,10 @@ async def admin_models(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
     require_admin(request, x_admin_token)
+    models = await _run_sync(load_models_from_cache, timeout=ADMIN_SYNC_TIMEOUT)
     return {
         "object": "list",
-        "data": load_models_from_cache(),
+        "data": models,
         "default_model": DEFAULT_MODEL,
     }
 
@@ -1176,7 +1428,7 @@ async def models_sync(
 ):
     """Fetch model list from cli-chat-proxy and update models_cache.json."""
     require_admin(request, x_admin_token)
-    result = sync_models_from_upstream()
+    result = await _run_sync(sync_models_from_upstream, timeout=ADMIN_SYNC_TIMEOUT)
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=result.get("error") or "sync failed")
     return result

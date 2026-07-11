@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.7"
+APP_VERSION = "1.8.8"
 
 
 def _on_startup() -> None:
@@ -1022,9 +1022,13 @@ async def health():
         pool = account_pool.pool_summary()
         creds = None
         try:
-            creds = account_pool.acquire()
+            # Health is read-only: never synchronously refresh an expired OIDC
+            # token while serving the event loop.
+            creds = account_pool.acquire(auto_refresh=False)
         except AuthError:
-            creds = load_credentials()
+            # Keep health bounded when every token is expired; maintenance or a
+            # real API request may renew tokens later.
+            raise
         return {
             "status": "ok",
             "version": APP_VERSION,
@@ -1120,7 +1124,7 @@ def _retryable_status(code: int) -> bool:
     return code in (401, 403, 429, 500, 502, 503, 504)
 
 
-def _resolve_conversation_affinity(
+async def _resolve_conversation_affinity(
     req: ChatCompletionRequest, request: Request
 ) -> tuple[str | None, str | None]:
     """
@@ -1148,15 +1152,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "messages is required", status=400, err_type="invalid_request_error"
         )
 
-    conv_fp, prefer_account = _resolve_conversation_affinity(req, request)
+    conv_fp, prefer_account = await _resolve_conversation_affinity(req, request)
     model = resolve_model(req.model)
 
     try:
-        chain = account_pool.try_acquire_sequence(
+        chain = await account_pool.try_acquire_sequence_async(
             model=model, prefer_account_id=prefer_account
         )
         if not chain:
-            chain = [account_pool.acquire(model=model)]
+            chain = [await account_pool.acquire_async(model=model)]
     except AuthError as e:
         return openai_error(str(e), status=401, err_type="authentication_error")
 
@@ -1208,11 +1212,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # Keep multi-turn memory on this account; rebind if failover
             if conv_fp:
                 if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conv_fp, first_tried, creds.auth_key
+                    await asyncio.to_thread(
+                        conversation_affinity.rebind_on_failover,
+                        conv_fp, first_tried, creds.auth_key,
                     )
                 else:
-                    conversation_affinity.bind_affinity(conv_fp, creds.auth_key)
+                    await asyncio.to_thread(
+                        conversation_affinity.bind_affinity,
+                        conv_fp, creds.auth_key,
+                    )
             message: dict[str, Any] = {
                 "role": "assistant",
                 "content": content if content else (None if tool_calls else ""),
@@ -1778,7 +1786,7 @@ async def _collect_completion(
 # ── Anthropic Messages API ──────────────────────────────────────────────────
 
 
-def _resolve_anthropic_affinity(
+async def _resolve_anthropic_affinity(
     req: anth.AnthropicMessagesRequest, request: Request
 ) -> tuple[str | None, str | None]:
     """Fingerprint for sticky multi-turn on Anthropic-shaped requests."""
@@ -1835,16 +1843,16 @@ async def anthropic_messages(
             err_type="invalid_request_error",
         )
 
-    conv_fp, prefer_account = _resolve_anthropic_affinity(req, request)
+    conv_fp, prefer_account = await _resolve_anthropic_affinity(req, request)
     model = resolve_model(req.model)
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
 
     try:
-        chain = account_pool.try_acquire_sequence(
+        chain = await account_pool.try_acquire_sequence_async(
             model=model, prefer_account_id=prefer_account
         )
         if not chain:
-            chain = [account_pool.acquire(model=model)]
+            chain = [await account_pool.acquire_async(model=model)]
     except AuthError as e:
         return _anthropic_error_response(
             str(e), status=401, err_type="authentication_error"
@@ -1899,11 +1907,15 @@ async def anthropic_messages(
             account_pool.report_success(creds.auth_key)
             if conv_fp:
                 if prefer_account and prefer_account != creds.auth_key:
-                    conversation_affinity.rebind_on_failover(
-                        conv_fp, first_tried, creds.auth_key
+                    await asyncio.to_thread(
+                        conversation_affinity.rebind_on_failover,
+                        conv_fp, first_tried, creds.auth_key,
                     )
                 else:
-                    conversation_affinity.bind_affinity(conv_fp, creds.auth_key)
+                    await asyncio.to_thread(
+                        conversation_affinity.bind_affinity,
+                        conv_fp, creds.auth_key,
+                    )
 
             result = anth.openai_completion_to_anthropic(
                 content=content or "",
@@ -2021,12 +2033,14 @@ async def _stream_anthropic_with_failover(
                     account_pool.report_success(creds.auth_key)
                     if conversation_fp:
                         if idx > 0:
-                            conversation_affinity.rebind_on_failover(
-                                conversation_fp, first_tried, creds.auth_key
+                            await asyncio.to_thread(
+                                conversation_affinity.rebind_on_failover,
+                                conversation_fp, first_tried, creds.auth_key,
                             )
                         else:
-                            conversation_affinity.bind_affinity(
-                                conversation_fp, creds.auth_key
+                            await asyncio.to_thread(
+                                conversation_affinity.bind_affinity,
+                                conversation_fp, creds.auth_key,
                             )
 
                     # message_start first — only after upstream accepted

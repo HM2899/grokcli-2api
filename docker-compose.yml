@@ -6,17 +6,24 @@ services:
     image: grokcli-2api:local
     container_name: grokcli-2api
     ports:
-      - "3000:3000"
+      - "40081:40081"
     environment:
       GROK2API_HOST: "0.0.0.0"
-      GROK2API_PORT: "3000"
+      GROK2API_PORT: "40081"
       GROK2API_OPEN_BROWSER: "0"
-      # Optional:
-      # GROK2API_ADMIN_PASSWORD: "change-me"
-      # GROK2API_MOEMAIL_API_KEY: ""
-      # GROK2API_MOEMAIL_BASE_URL: "https://moemail.521884.xyz"
-      # GROK2API_MOEMAIL_DOMAIN: "lolicc.online"
-      # GROK2API_XAI_PROXY: ""
+      GROK2API_ACCOUNT_MODE: "round_robin"
+      # Background token maintainer and model-health probe run in bounded
+      # daemon threads and no longer block the Uvicorn event loop.
+      GROK2API_TOKEN_MAINTAIN: "1"
+      GROK2API_MODEL_HEALTH: "1"
+      GROK2API_TOKEN_REFRESH_WORKERS: "4"
+      GROK2API_MODEL_PROBE_WORKERS: "4"
+      GROK2API_QUOTA_WORKERS: "4"
+      GROK2API_SSO_IMPORT_WORKERS: "4"
+      GROK2API_DATA_DIR: "/app/data"
+      GROK2API_PUBLIC_BASE_URL: ""
+    env_file:
+      - /root/grokcli-2api.env
     volumes:
-      - ./data:/app/data
+      - /var/lib/grokcli-2api/data:/app/data
     restart: unless-stopped

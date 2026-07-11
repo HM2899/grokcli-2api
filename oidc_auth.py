@@ -290,6 +290,7 @@ def refresh_access_token(
     entry: dict[str, Any],
     *,
     client: httpx.Client | None = None,
+    timeout: float = 30.0,
 ) -> dict[str, Any]:
     """
     Exchange refresh_token for a new access_token (and rotated refresh_token).
@@ -314,7 +315,7 @@ def refresh_access_token(
     if client is not None:
         resp = client.post(OIDC_TOKEN_URL, data=form, headers=headers)
     else:
-        with httpx.Client(timeout=30.0) as c:
+        with httpx.Client(timeout=timeout) as c:
             resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
     if resp.status_code >= 400:
         raise ValueError(f"refresh failed {resp.status_code}: {resp.text[:400]}")
@@ -666,10 +667,11 @@ def refresh_all_accounts(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     try:
-        from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS
+        from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS, OIDC_NETWORK_TIMEOUT
     except Exception:
         TOKEN_REFRESH_WORKERS = 4
         TOKEN_REFRESH_BATCH = 40
+        OIDC_NETWORK_TIMEOUT = 60.0
 
     if max_workers is None:
         max_workers = TOKEN_REFRESH_WORKERS
@@ -752,7 +754,7 @@ def refresh_all_accounts(
         # One short-lived client per worker task is still better than unbounded
         # fan-out; pool size is already capped by max_workers.
         try:
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(timeout=OIDC_NETWORK_TIMEOUT) as client:
                 r = refresh_and_persist(aid, entry, client=client, persist=False)
             with updates_lock:
                 updates[r["account_id"]] = r["entry"]
