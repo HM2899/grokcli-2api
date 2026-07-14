@@ -649,6 +649,7 @@ function rebindPageControls() {
   on("btn-copy-device", "onclick", () => copyDeviceCode());
   on("btn-import", "onclick", () => importJsonFiles());
   on("btn-import-sso", "onclick", () => importSsoCookies());
+on("btn-export-sso", "onclick", () => exportRegistrationSso());
   if ($("btn-export")) on("btn-export", "onclick", () => exportAllAccounts());
   on("btn-logout-cli", "onclick", async () => {
     if (!confirm("注销全部 Grok 账号？（将清空数据库账号池与本地镜像）")) return;
@@ -4738,6 +4739,83 @@ async function pollSsoImportJob(jobId, { totalHint = 0 } = {}) {
   return job;
 }
 
+
+async function exportRegistrationSso() {
+  const fmt = (($("sso-export-format") && $("sso-export-format").value) || "sso").trim();
+  const batch = (($("sso-export-batch") && $("sso-export-batch").value) || "").trim();
+  const importedOnly = !($("sso-export-imported-only") && !$("sso-export-imported-only").checked);
+  const includePassword = !!( $("sso-export-password") && $("sso-export-password").checked );
+  const btn = $("btn-export-sso");
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "导出中…";
+  }
+  try {
+    const body = {
+      batch_id: batch || null,
+      status: importedOnly ? ["imported"] : [],
+      include_password: includePassword || fmt === "email_password_sso",
+      format: fmt,
+      download: false,
+    };
+    const res = await api("/accounts/register-email/export-sso", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    if (!res || res.ok === false) {
+      throw new Error((res && (res.detail || res.error || res.message)) || "导出失败");
+    }
+    let content = "";
+    let filename = `grok2api-sso-export-${Date.now()}`;
+    let mime = "text/plain;charset=utf-8";
+    if (fmt === "json") {
+      content = JSON.stringify(res, null, 2);
+      filename += ".json";
+      mime = "application/json;charset=utf-8";
+    } else {
+      content = res.text || "";
+      if (!content && Array.isArray(res.items)) {
+        content = res.items.map((it) => it.sso || "").filter(Boolean).join("\n") + "\n";
+      }
+      filename += ".txt";
+    }
+    if (!content || !String(content).trim()) {
+      throw new Error("没有可导出的 SSO（注册会话可能已清空，需重新注册）");
+    }
+    // Prefer browser download
+    try {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (_) {
+      // fallback: fill textarea for copy
+      if ($("sso-cookies")) $("sso-cookies").value = content;
+    }
+    setLogPanel(
+      "sso-result",
+      `导出 SSO 完成：${res.count || 0} 条` + (batch ? `（batch=${batch}）` : "") + `\n格式=${fmt}`,
+      { forceShow: true }
+    );
+    toast(`已导出 ${res.count || 0} 条 SSO`, true);
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    setLogPanel("sso-result", "导出 SSO 失败：\n" + msg, { forceShow: true });
+    toast("导出 SSO 失败: " + msg, false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "导出 SSO";
+    }
+  }
+}
+
 async function importSsoCookies() {
   const ta = $("sso-cookies");
   const fileInput = $("sso-file");
@@ -5053,6 +5131,7 @@ if ($("import-file")) {
 }
 on("btn-import", "onclick", () => importJsonFiles());
 on("btn-import-sso", "onclick", () => importSsoCookies());
+on("btn-export-sso", "onclick", () => exportRegistrationSso());
 if ($("sso-file")) {
   on("sso-file", "onchange", () => {    const f = $("sso-file").files && $("sso-file").files[0];
     const label = $("sso-file-name");

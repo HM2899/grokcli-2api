@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.77** · 注册机 device-flow 限流重试 · Update→Edit · 防假断流 · Codex 思考链不泄漏
+**当前版本：v1.9.78** · 导出注册 SSO · device-flow 限流重试 · Update→Edit · 防假断流
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.77` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.78` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -50,7 +50,7 @@
 | OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
 | Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；参数别名归一化；残缺编辑不下发 |
-| 注册机 | SSO→token Device Flow 全局限流节流 + 429/slow_down/rate_limited 自动重试 |
+| 注册机 | SSO→token Device Flow 限流节流/重试；**注册会话一键导出 SSO**（纯 cookie / 邮箱:密码:SSO / JSON） |
 | 管理台 | 账号、Key、协议注册、测活、续期、**任务日志**、用量、设置 |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；可选**出站代理池**（聊天/测活/续期） |
 | 会话粘性 | `prompt_cache_key`（body/header）与 Responses `previous_response_id` 粘同一账号；未传时自动 mint 并回传 |
@@ -142,7 +142,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.77
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.78
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -181,7 +181,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.77
+    image: ghcr.io/hm2899/grokcli-2api:1.9.78
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -405,15 +405,15 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.77"
+git add -A && git commit -m "release: v1.9.78"
 git push origin main
-git tag -a v1.9.77 -m "v1.9.77"
-git push origin v1.9.77
-gh release create v1.9.77 --title "v1.9.77 注册机 device-flow 限流重试" --notes-file - <<'EOF'
+git tag -a v1.9.78 -m "v1.9.78"
+git push origin v1.9.78
+gh release create v1.9.78 --title "v1.9.78 导出注册 SSO" --notes-file - <<'EOF'
 ## Highlights
-- 注册机：Device Flow 全局限流节流 + 429/slow_down/rate_limited 自动重试
-- 修并发注册「连着两个 SSO 转换失败」
-- 继承 v1.9.76：Update→Edit、防假断流、Codex 思考链不泄漏
+- 注册会话一键导出 SSO（管理台 + API）
+- 支持纯 cookie / sso=… / 邮箱+SSO / 邮箱:密码:SSO / JSON
+- 继承 v1.9.77 device-flow 限流重试
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -422,7 +422,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.77
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.78
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -466,7 +466,11 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.77**（当前）
+- **v1.9.78**（当前）
+  - **导出注册 SSO**：管理台 + API 从注册会话导出 cookie（`sso` / `sso=…` / 邮箱+SSO / 邮箱:密码:SSO / JSON）
+  - `GET|POST /admin/api/accounts/register-email/export-sso`，支持 batch / status 过滤与下载
+  - 继承 v1.9.77：device-flow 限流重试与节流
+- **v1.9.77**
   - **注册机 device-flow 限流**：并发换 token 时 xAI `429 slow_down` / `rate_limited` 自动退避重试
   - 全局 device-flow 最小间隔（默认 1.2s，`GROK2API_SSO_DEVICE_GAP_SEC`）
   - 失败文案标明常见原因是并发 rate limit（SSO 已拿到后的转换阶段）
@@ -566,7 +570,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.77**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.78**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

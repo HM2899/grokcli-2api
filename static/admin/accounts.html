@@ -387,6 +387,32 @@
       <button type="button" class="g2a-btn g2a-btn-primary" id="btn-import-sso">导入 SSO</button>
     </div>
   </div>
+  <div class="g2a-form-row g2a-import-controls" style="margin-top:10px">
+    <div class="g2a-field g2a-field-sm">
+      <label>导出格式</label>
+      <select id="sso-export-format">
+        <option value="sso" selected>纯 SSO</option>
+        <option value="cookie">sso=…</option>
+        <option value="email_sso">邮箱 + SSO</option>
+        <option value="email_password_sso">邮箱:密码:SSO</option>
+        <option value="json">JSON</option>
+      </select>
+    </div>
+    <div class="g2a-field g2a-field-sm">
+      <label>批次 ID（可选）</label>
+      <input id="sso-export-batch" type="text" placeholder="batch_xxx 留空=全部" />
+    </div>
+    <div class="g2a-field g2a-field-check">
+      <label class="g2a-check"><input type="checkbox" id="sso-export-imported-only" checked /> 仅已入库</label>
+    </div>
+    <div class="g2a-field g2a-field-check">
+      <label class="g2a-check"><input type="checkbox" id="sso-export-password" /> 含密码</label>
+    </div>
+    <div class="g2a-field g2a-field-action">
+      <button type="button" class="g2a-btn" id="btn-export-sso">导出 SSO</button>
+    </div>
+  </div>
+  <p class="g2a-muted" style="margin-top:6px">从<strong>注册会话</strong>导出 SSO cookie（注册机内存会话；进程重启后可能清空）。可直接用于上方导入。</p>
   <div id="sso-progress-wrap" class="g2a-sso-progress hidden" hidden>
     <div class="g2a-sso-progress-meta">
       <span id="sso-progress-label" class="g2a-muted">准备中…</span>
@@ -444,6 +470,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.9d84f2f9c6.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.1cca5ccf16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

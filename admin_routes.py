@@ -9,7 +9,7 @@ import time
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Response, APIRouter, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
@@ -386,6 +386,32 @@ class AccountBulkExportBody(BaseModel):
         default=True,
         description="Include access/refresh tokens (required for re-import)",
     )
+
+
+class ExportRegistrationSsoBody(BaseModel):
+    """Export SSO cookies collected during email registration sessions."""
+
+    batch_id: str | None = Field(
+        default=None, description="Only sessions from this registration batch"
+    )
+    session_ids: list[str] = Field(
+        default_factory=list,
+        max_length=5000,
+        description="Optional explicit session ids; empty = all matching filters",
+    )
+    status: list[str] = Field(
+        default_factory=list,
+        description="Filter by session status (e.g. imported). Empty = any status with SSO",
+    )
+    include_password: bool = Field(
+        default=False,
+        description="Include registration password when present (email:password:sso lines)",
+    )
+    format: str = Field(
+        default="sso",
+        description="sso | cookie | email_sso | email_password_sso | json",
+    )
+    download: bool = Field(default=True, description="Return as file attachment")
 
 
 class AccountProbeBody(BaseModel):
@@ -1989,6 +2015,172 @@ async def list_email_registration_sessions(
     except Exception:
         pass
     return out
+
+
+@router.get("/accounts/register-email/export-sso")
+async def export_registration_sso_get(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    batch_id: str | None = None,
+    status: str | None = None,
+    include_password: int = 0,
+    format: str = "sso",
+    download: int = 1,
+):
+    """GET convenience wrapper for export-sso (query params)."""
+    body = ExportRegistrationSsoBody(
+        batch_id=(batch_id or "").strip() or None,
+        status=[s.strip() for s in (status or "").split(",") if s.strip()],
+        include_password=bool(include_password),
+        format=(format or "sso").strip().lower() or "sso",
+        download=bool(download),
+    )
+    return await export_registration_sso(body, request, x_admin_token)
+
+
+@router.post("/accounts/register-email/export-sso")
+async def export_registration_sso(
+    body: ExportRegistrationSsoBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Export SSO cookies from registration sessions.
+
+    Registration keeps ``sess["sso"]`` after import (in-memory session store).
+    OIDC accounts themselves only store tokens — use this to re-export the raw
+    SSO cookie for re-import / backup.
+    """
+    require_admin(request, x_admin_token)
+    adapter = _require_register_adapter()
+    listed = adapter.list_registration_sessions() or {}
+    sessions = listed.get("sessions") if isinstance(listed, dict) else listed
+    if not isinstance(sessions, list):
+        sessions = []
+
+    want_ids = {str(x).strip() for x in (body.session_ids or []) if str(x).strip()}
+    want_status = {str(x).strip().lower() for x in (body.status or []) if str(x).strip()}
+    want_batch = (body.batch_id or "").strip() or None
+    fmt = (body.format or "sso").strip().lower() or "sso"
+    if fmt not in {"sso", "cookie", "email_sso", "email_password_sso", "json"}:
+        raise HTTPException(status_code=400, detail=f"unsupported format: {fmt}")
+
+    rows: list[dict[str, Any]] = []
+    for sess in sessions:
+        if not isinstance(sess, dict):
+            continue
+        sid = str(sess.get("id") or "").strip()
+        if want_ids and sid not in want_ids:
+            continue
+        if want_batch and str(sess.get("batch_id") or "").strip() != want_batch:
+            continue
+        st = str(sess.get("status") or "").strip().lower()
+        if want_status and st not in want_status:
+            continue
+        sso = str(sess.get("sso") or "").strip()
+        if not sso:
+            cookies = sess.get("session_cookies")
+            if isinstance(cookies, dict):
+                sso = str(cookies.get("sso") or cookies.get("sso-rw") or "").strip()
+        if not sso:
+            continue
+        email = str(sess.get("email") or "").strip()
+        password = str(sess.get("password") or "").strip()
+        rows.append(
+            {
+                "id": sid,
+                "batch_id": sess.get("batch_id"),
+                "batch_index": sess.get("batch_index"),
+                "status": sess.get("status"),
+                "email": email,
+                "password": password if body.include_password else "",
+                "sso": sso,
+            }
+        )
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="no registration sessions with SSO cookie matched filters",
+        )
+
+    # De-dupe by sso value, keep first email
+    seen: set[str] = set()
+    unique_rows: list[dict[str, Any]] = []
+    for r in rows:
+        key = r["sso"]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(r)
+
+    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    if fmt == "json":
+        payload = {
+            "ok": True,
+            "count": len(unique_rows),
+            "matched": len(rows),
+            "format": fmt,
+            "batch_id": want_batch,
+            "exported_at": ts,
+            "items": unique_rows,
+        }
+        body_bytes = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        media = "application/json; charset=utf-8"
+        filename = f"grok2api-sso-export-{ts}.json"
+        if body.download:
+            return Response(
+                content=body_bytes,
+                media_type=media,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "X-Export-Count": str(len(unique_rows)),
+                },
+            )
+        return payload
+
+    lines: list[str] = []
+    for r in unique_rows:
+        sso = r["sso"]
+        email = r.get("email") or ""
+        password = r.get("password") or ""
+        if fmt == "cookie":
+            lines.append(f"sso={sso}")
+        elif fmt == "email_sso":
+            lines.append(f"{email}\t{sso}" if email else sso)
+        elif fmt == "email_password_sso":
+            if email and password:
+                lines.append(f"{email}:{password}:{sso}")
+            elif email:
+                lines.append(f"{email}::{sso}")
+            else:
+                lines.append(sso)
+        else:  # sso raw
+            lines.append(sso)
+
+    text_body = "\n".join(lines) + ("\n" if lines else "")
+    filename = f"grok2api-sso-export-{ts}.txt"
+    if body.download:
+        return Response(
+            content=text_body.encode("utf-8"),
+            media_type="text/plain; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Export-Count": str(len(unique_rows)),
+            },
+        )
+    return {
+        "ok": True,
+        "count": len(unique_rows),
+        "matched": len(rows),
+        "format": fmt,
+        "batch_id": want_batch,
+        "exported_at": ts,
+        "text": text_body,
+        "items": [
+            {"email": r.get("email"), "status": r.get("status"), "sso": r.get("sso")[:24] + "..."}
+            for r in unique_rows
+        ],
+    }
 
 
 @router.get("/accounts/register-email/batches/{batch_id}")
