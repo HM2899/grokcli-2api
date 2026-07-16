@@ -228,7 +228,7 @@ class EmailRegistrationBody(BaseModel):
     email: str | None = Field(default=None, max_length=256)
     mailbox_id: str | None = Field(default=None, max_length=256)
     prefix: str | None = Field(default=None, max_length=64)
-    domain: str | None = Field(default=None, max_length=128)
+    domain: str | None = Field(default=None, max_length=2048)
     # MoeMail official presets: 1h / 24h / 3d / permanent(0). YYDS is ~24h temp.
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)
     api_key: str | None = Field(
@@ -241,7 +241,11 @@ class EmailRegistrationBody(BaseModel):
     gptmail_api_key: str | None = Field(default=None, max_length=512)
     cfmail_api_key: str | None = Field(default=None, max_length=512)
     moemail_domain: str | None = Field(default=None, max_length=128)
-    yyds_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Comma-separated YYDS domains; one is picked per mailbox",
+    )
     gptmail_domain: str | None = Field(default=None, max_length=128)
     cfmail_domain: str | None = Field(default=None, max_length=128)
     captcha_provider: str | None = Field(
@@ -342,11 +346,15 @@ class RegistrationConfigBody(BaseModel):
     gptmail_api_key: str | None = Field(default=None, max_length=512)
     domain: str | None = Field(
         default=None,
-        max_length=128,
+        max_length=2048,
         description="Active domain for selected mail provider",
     )
     moemail_domain: str | None = Field(default=None, max_length=128)
-    yyds_domain: str | None = Field(default=None, max_length=128)
+    yyds_domain: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Comma-separated YYDS domains; one is picked per mailbox",
+    )
     gptmail_domain: str | None = Field(default=None, max_length=128)
     prefix: str | None = Field(default=None, max_length=64)
     expiry_ms: int | None = Field(default=None, ge=0, le=259200000)

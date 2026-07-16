@@ -2067,12 +2067,12 @@ def _normalize_registration_config(
             return s[:max_len]
         return ""
 
-    def _pick_domain(key: str) -> str:
+    def _pick_domain(key: str, max_len: int = 128) -> str:
         # Domain slots: empty string is a real value (auto domain). Only fall
         # back to env when the key is completely absent from src.
         if key in src:
-            return str(src.get(key) or "").strip().lstrip("@").strip(".")[:128]
-        return str(env.get(key, "") or "").strip().lstrip("@").strip(".")[:128]
+            return str(src.get(key) or "").strip().lstrip("@").strip(".")[:max_len]
+        return str(env.get(key, "") or "").strip().lstrip("@").strip(".")[:max_len]
 
     legacy_base_url = _pick_str("base_url", 256)
     cfg["moemail_base_url"] = _pick_str("moemail_base_url", 256)
@@ -2084,11 +2084,11 @@ def _normalize_registration_config(
     cfg["cfmail_api_key"] = _pick_str("cfmail_api_key", 512)
     # Do NOT env-fill legacy domain into every provider — only use explicit src.
     if "domain" in src:
-        legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:128]
+        legacy_domain = str(src.get("domain") or "").strip().lstrip("@").strip(".")[:2048]
     else:
         legacy_domain = ""
     cfg["moemail_domain"] = _pick_domain("moemail_domain")
-    cfg["yyds_domain"] = _pick_domain("yyds_domain")
+    cfg["yyds_domain"] = _pick_domain("yyds_domain", 2048)
     cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
     cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)

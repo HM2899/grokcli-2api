@@ -474,8 +474,12 @@ def yyds_create_mailbox(
         )
     base = normalize_yyds_base_url(base_url or MOEMAIL_BASE_URL)
     # Never fall back to MOEMAIL_DOMAIN (MoeMail default / example.com). Empty
-    # means auto: randomly pick a healthy public domain from GET /v1/domains.
-    dom = (domain or "").strip().lstrip("@").strip(".")
+    # means auto; comma-separated configured domains are picked per mailbox.
+    domains = [
+        item.strip().lstrip("@").strip(".")
+        for item in re.split(r"[,，]", domain or "")
+    ]
+    dom = random.choice([item for item in domains if item]) if any(domains) else ""
     if not dom:
         dom = yyds_pick_domain(api_key=key, base_url=base) or ""
     if not dom:

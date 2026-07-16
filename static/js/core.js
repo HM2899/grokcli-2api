@@ -2915,7 +2915,7 @@ function syncRegMailProviderUI() {
   }
   if ($("reg-domain")) {
     $("reg-domain").placeholder = isYyds
-      ? "留空则自动随机获取公开域名"
+      ? "多个域名用逗号分隔；留空则自动随机获取"
       : isGpt
         ? "可选；留空由 GPTMail 随机分配"
         : isCf
