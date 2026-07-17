@@ -689,14 +689,58 @@ def convert_responses_tools(tools: Any) -> list[dict[str, Any]] | None:
 
 
 def extract_reasoning_effort(req: dict[str, Any]) -> str | None:
+    """Extract and normalize reasoning effort for cli-chat-proxy.
+
+    Upstream grok-4.5 only accepts: low | medium | high | xhigh
+    (plus aliases normalized to those). Codex/OpenAI clients often send
+    values like auto/default/none/minimal which become Upstream 400
+    "Invalid reasoning effort" and empty the account pool.
+    """
     raw = req.get("reasoning_effort")
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
     reasoning = req.get("reasoning")
-    if isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort.strip():
-            return effort.strip()
+    if raw is None and isinstance(reasoning, dict):
+        raw = reasoning.get("effort")
+    if raw is None:
+        return None
+
+    # Reuse app normalizer when available (single source of truth).
+    try:
+        from grok2api.app import _normalize_reasoning_effort  # type: ignore
+
+        return _normalize_reasoning_effort(raw)
+    except Exception:
+        pass
+
+    if isinstance(raw, bool):
+        return "medium" if raw else None
+    s = str(raw).strip().lower()
+    if not s or s in {"none", "null", "false", "off", "disabled"}:
+        return None
+    aliases = {
+        "minimal": "low",
+        "min": "low",
+        "l": "low",
+        "m": "medium",
+        "med": "medium",
+        "h": "high",
+        "max": "xhigh",
+        "maximum": "xhigh",
+        "ultra": "xhigh",
+        "extra_high": "xhigh",
+        "extrahigh": "xhigh",
+        "extra-high": "xhigh",
+        "enabled": "medium",
+        "adaptive": "medium",
+        "true": "medium",
+        "on": "medium",
+        "auto": "medium",
+        "default": "medium",
+        "standard": "medium",
+    }
+    s = aliases.get(s, s)
+    if s in {"low", "medium", "high", "xhigh"}:
+        return s
+    # Unknown labels: drop rather than forward (upstream 400s hard).
     return None
 
 

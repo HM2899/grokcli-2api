@@ -1297,6 +1297,20 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
         body.pop("function_call", None)
         body.pop("parallel_tool_calls", None)
 
+    # reasoning_effort: only low/medium/high/xhigh are accepted by grok-4.5.
+    # Codex often sends auto/default/none → Upstream 400 Invalid reasoning effort.
+    if "reasoning_effort" in body:
+        from_val = body.get("reasoning_effort")
+        norm = _normalize_reasoning_effort(from_val)
+        if norm in {"low", "medium", "high", "xhigh"}:
+            body["reasoning_effort"] = norm
+        else:
+            body.pop("reasoning_effort", None)
+    # Nested Responses-style reasoning: {effort: ...} should not leak upstream
+    # on the chat path; only flat reasoning_effort is used by cli-chat-proxy.
+    if isinstance(body.get("reasoning"), dict):
+        body.pop("reasoning", None)
+
 
 def _canonicalize_json_value(value: Any) -> Any:
     """Recursively sort object keys so identical schemas serialize identically."""
@@ -2141,15 +2155,22 @@ def _normalize_reasoning_effort(value: Any) -> str | None:
         "ultra": "xhigh",
         "extra_high": "xhigh",
         "extrahigh": "xhigh",
+        "extra-high": "xhigh",
         "enabled": "medium",
         "adaptive": "medium",
         "true": "medium",
         "on": "medium",
+        # Codex / OpenAI client defaults that upstream rejects as invalid.
+        "auto": "medium",
+        "default": "medium",
+        "standard": "medium",
     }
     s = aliases.get(s, s)
     if s in {"low", "medium", "high", "xhigh"}:
         return s
-    return s[:32] if s else None
+    # Unknown effort strings used to be forwarded and became Upstream 400
+    # "Invalid reasoning effort" (Codex → grok-4.5). Drop instead.
+    return None
 
 
 def _extract_reasoning_effort_from_payload(payload: Any) -> str | None:
