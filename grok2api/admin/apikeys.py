@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from grok2api.config import API_KEY, KEYS_FILE, REQUIRE_API_KEY
+from grok2api.config import API_KEY, KEYS_FILE, REQUIRE_API_KEY, STORE_BACKEND
 
 
 _lock = threading.RLock()
@@ -108,10 +108,12 @@ def _pg_keys():
 def _load_raw() -> dict[str, Any]:
     pg = _pg_keys()
     if pg is not None:
-        try:
-            return {"keys": pg.list_raw()}
-        except Exception:
-            pass
+        return {"keys": pg.list_raw()}
+    if str(STORE_BACKEND or "hybrid").strip().lower() != "file":
+        raise RuntimeError(
+            "PostgreSQL API key read failed in hybrid mode; refusing file "
+            "fallback to prevent split-brain data"
+        )
     if not KEYS_FILE.is_file():
         return {"keys": []}
     try:
@@ -129,11 +131,13 @@ def _save_raw(data: dict[str, Any]) -> None:
     keys = list(data.get("keys") or [])
     pg = _pg_keys()
     if pg is not None:
-        try:
-            pg.replace_all(keys)
-            return
-        except Exception:
-            pass
+        pg.replace_all(keys)
+        return
+    if str(STORE_BACKEND or "hybrid").strip().lower() != "file":
+        raise RuntimeError(
+            "PostgreSQL API key write failed in hybrid mode; refusing file "
+            "fallback to prevent split-brain data"
+        )
     _ensure_parent(KEYS_FILE)
     tmp = KEYS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -188,9 +192,13 @@ def create_key(name: str, note: str = "") -> dict[str, Any]:
     )
     row = asdict(rec)
     with _lock:
-        data = _load_raw()
-        data["keys"].append(row)
-        _save_raw(data)  # PG replace_all (or keys.json in file mode)
+        pg = _pg_keys()
+        if pg is not None:
+            pg.insert(row)
+        else:
+            data = _load_raw()
+            data["keys"].append(row)
+            _save_raw(data)
         _cache_invalidate()
     out = rec.public_dict()
     out["key"] = raw  # alias for older admin UI
@@ -209,11 +217,9 @@ def regenerate_key(key_id: str) -> dict[str, Any] | None:
                 k["secret"] = raw
                 pg = _pg_keys()
                 if pg is not None:
-                    try:
-                        pg.upsert(k)
-                    except Exception:
-                        pass
-                _save_raw(data)
+                    pg.upsert(k)
+                else:
+                    _save_raw(data)
                 _cache_invalidate()
                 out = _from_dict(k).public_dict()
                 out["key"] = raw
@@ -229,11 +235,9 @@ def set_enabled(key_id: str, enabled: bool) -> dict[str, Any] | None:
                 k["enabled"] = bool(enabled)
                 pg = _pg_keys()
                 if pg is not None:
-                    try:
-                        pg.upsert(k)
-                    except Exception:
-                        pass
-                _save_raw(data)
+                    pg.upsert(k)
+                else:
+                    _save_raw(data)
                 _cache_invalidate()
                 return _from_dict(k).public_dict()
     return None
@@ -243,13 +247,15 @@ def delete_key(key_id: str) -> bool:
     with _lock:
         pg = _pg_keys()
         if pg is not None:
-            try:
-                ok = bool(pg.delete(key_id))
-                if ok:
-                    _cache_invalidate()
-                return ok
-            except Exception:
-                pass
+            ok = bool(pg.delete(key_id))
+            if ok:
+                _cache_invalidate()
+            return ok
+        if str(STORE_BACKEND or "hybrid").strip().lower() != "file":
+            raise RuntimeError(
+                "PostgreSQL API key delete failed in hybrid mode; refusing file "
+                "fallback to prevent split-brain data"
+            )
         data = _load_raw()
         before = len(data["keys"])
         data["keys"] = [k for k in data["keys"] if k.get("id") != key_id]
@@ -271,11 +277,9 @@ def update_key(key_id: str, *, name: str | None = None, note: str | None = None)
                     k["note"] = note
                 pg = _pg_keys()
                 if pg is not None:
-                    try:
-                        pg.upsert(k)
-                    except Exception:
-                        pass
-                _save_raw(data)
+                    pg.upsert(k)
+                else:
+                    _save_raw(data)
                 _cache_invalidate()
                 return _from_dict(k).public_dict()
     return None

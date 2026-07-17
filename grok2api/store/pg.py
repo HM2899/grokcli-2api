@@ -272,11 +272,10 @@ def _ensure_schema(pool) -> None:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
             for stmt in _SCHEMA_MIGRATIONS:
-                try:
-                    cur.execute(stmt)
-                except Exception:
-                    # Best-effort; table may already be up to date.
-                    pass
+                # These statements are idempotent. Any failure must abort startup:
+                # swallowing one error leaves PostgreSQL's transaction aborted and
+                # can make the process serve against a partially upgraded schema.
+                cur.execute(stmt)
         conn.commit()
     _schema_ready = True
 

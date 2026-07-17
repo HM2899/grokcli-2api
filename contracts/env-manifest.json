@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "variables": [
+    {
+      "name": "GROK2API_HOST",
+      "type": "string",
+      "default": "0.0.0.0",
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_PORT",
+      "type": "integer",
+      "default": 3000,
+      "minimum": 1,
+      "maximum": 65535,
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_DEFAULT_MODEL",
+      "type": "string",
+      "default": "grok-4.5",
+      "scope": "startup_snapshot",
+      "future_scope": "runtime_setting"
+    },
+    {
+      "name": "GROK_CLI_CHAT_PROXY_BASE_URL",
+      "type": "url",
+      "default": "https://cli-chat-proxy.grok.com/v1",
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_REDIS_URL",
+      "aliases": [
+        "REDIS_URL"
+      ],
+      "type": "url",
+      "default": "redis://127.0.0.1:6379/0",
+      "scope": "startup",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_DATABASE_URL",
+      "aliases": [
+        "DATABASE_URL"
+      ],
+      "type": "url",
+      "default": "postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api",
+      "scope": "startup",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_REDIS_PREFIX",
+      "type": "string",
+      "default": "g2a",
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_STORE_BACKEND",
+      "type": "enum",
+      "values": [
+        "hybrid",
+        "file"
+      ],
+      "default": "hybrid",
+      "scope": "startup",
+      "go_behavior": "file mode fails closed until JSON-to-PostgreSQL migration is complete"
+    },
+    {
+      "name": "GROK2API_API_KEY",
+      "type": "string",
+      "default": "",
+      "scope": "compat_auth",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_REQUIRE_API_KEY",
+      "type": "enum",
+      "values": [
+        "auto",
+        "1",
+        "0",
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off"
+      ],
+      "default": "auto",
+      "scope": "compat_auth"
+    },
+    {
+      "name": "GROK2API_WORKERS",
+      "type": "integer",
+      "default": "auto",
+      "scope": "python_oracle_only"
+    },
+    {
+      "name": "GROK2API_REQUIRE_SHARED_STORES",
+      "type": "boolean",
+      "default": true,
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_REQUIRE_MIGRATIONS",
+      "type": "boolean",
+      "default": true,
+      "scope": "startup",
+      "go_behavior": "verify migration checksums before readiness; never auto-apply from app startup"
+    },
+    {
+      "name": "GROK2API_RUNTIME",
+      "type": "enum",
+      "values": [
+        "go",
+        "python"
+      ],
+      "default": "go",
+      "scope": "startup_cutover"
+    },
+    {
+      "name": "GROK2API_GO_PUBLIC_READ",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_CHAT",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_MESSAGES",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_RESPONSES",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_ADMIN_READ",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_ADMIN_WRITE",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_route"
+    },
+    {
+      "name": "GROK2API_GO_MAINTAINER",
+      "type": "boolean",
+      "default": false,
+      "scope": "staged_go_background"
+    },
+    {
+      "name": "GROK2API_GO_WRITES",
+      "type": "boolean",
+      "default": false,
+      "scope": "data_safety"
+    },
+    {
+      "name": "GROK2API_GO_OWNERSHIP_MODE",
+      "type": "enum",
+      "values": [
+        "disabled",
+        "canary",
+        "all"
+      ],
+      "default": "disabled",
+      "scope": "data_safety"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_MODE",
+      "type": "enum",
+      "values": [
+        "external"
+      ],
+      "default": "external",
+      "scope": "registration_boundary"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_SERVICE_URL",
+      "type": "url",
+      "default": "",
+      "scope": "registration_boundary",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_STATIC_DIR",
+      "type": "path",
+      "default": "static",
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_SSE_KEEPALIVE",
+      "type": "seconds",
+      "default": 4,
+      "scope": "startup_snapshot",
+      "future_scope": "runtime_setting"
+    },
+    {
+      "name": "GROK2API_TIMEOUT",
+      "type": "seconds",
+      "default": 900,
+      "scope": "startup"
+    },
+    {
+      "name": "GROK2API_HISTORY_COMPACT",
+      "type": "boolean",
+      "default": false,
+      "scope": "runtime_behavior"
+    },
+    {
+      "name": "GROK2API_HISTORY_COMPACT_AUTO_CHARS",
+      "type": "integer",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 5000000,
+      "scope": "runtime_behavior"
+    },
+    {
+      "name": "GROK2API_OUTBOUND_MAX_TOOLS",
+      "type": "integer",
+      "default": 1,
+      "minimum": 0,
+      "maximum": 64,
+      "scope": "runtime_behavior",
+      "go_behavior": "Anthropic messages max tool_use blocks per turn; 0 = unlimited"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_TOKEN",
+      "type": "string",
+      "default": "",
+      "scope": "registration_boundary",
+      "sensitive": true
+    },
+    {
+      "name": "GROK2API_REGISTRATION_SIDECAR",
+      "type": "boolean",
+      "default": true,
+      "scope": "registration_boundary"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_HOST",
+      "type": "string",
+      "default": "127.0.0.1",
+      "scope": "registration_boundary"
+    },
+    {
+      "name": "GROK2API_REGISTRATION_PORT",
+      "type": "integer",
+      "default": 18070,
+      "scope": "registration_boundary"
+    }
+  ]
+}

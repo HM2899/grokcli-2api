@@ -47,13 +47,14 @@ services:
       # (compose network). Inline Turnstile Solver listens on container
       # loopback 127.0.0.1:5072 and is NOT published to the host.
       - "3000:3000"
+      - "40081:40081"
     shm_size: "1gb"
     security_opt:
       - seccomp:unconfined
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_HOST: "0.0.0.0"
-      GROK2API_PORT: "3000"
+      GROK2API_PORT: "40081"
       GROK2API_OPEN_BROWSER: "0"
       GROK2API_TOKEN_MAINTAIN: "1"
       GROK2API_MODEL_HEALTH: "1"
@@ -66,7 +67,7 @@ services:
       GROK2API_REDIS_URL: "redis://redis:6379/0"
       DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
       GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
-      # Inline local Turnstile Solver (same container)
+      # Inline local Turnstile Solver (same container, Python captcha)
       GROK2API_CAPTCHA_PROVIDER: "${GROK2API_CAPTCHA_PROVIDER:-local}"
       CAPTCHA_PROVIDER: "${CAPTCHA_PROVIDER:-local}"
       GROK2API_LOCAL_SOLVER_URL: "${GROK2API_LOCAL_SOLVER_URL:-http://127.0.0.1:5072}"
@@ -81,6 +82,13 @@ services:
       # Idle memory: warm browsers only when solving captcha; reclaim after quiet period
       TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
       TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
+      # Python registration + SSO sidecar (used when GROK2API_RUNTIME=go)
+      GROK2API_REGISTRATION_SIDECAR: "${GROK2API_REGISTRATION_SIDECAR:-1}"
+      GROK2API_REGISTRATION_HOST: "127.0.0.1"
+      GROK2API_REGISTRATION_PORT: "18070"
+      GROK2API_REGISTRATION_SERVICE_URL: "${GROK2API_REGISTRATION_SERVICE_URL:-http://127.0.0.1:18070}"
+      GROK2API_REGISTRATION_TOKEN: "${GROK2API_REGISTRATION_TOKEN:-}"
+      PYTHONPATH: "/app:/app/grok-build-auth"
     healthcheck:
       # $$ keeps substitution inside the container so override ports (e.g. 40081) work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]

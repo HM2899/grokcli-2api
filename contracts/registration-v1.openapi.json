@@ -1,0 +1,28 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "grok2api registration internal API",
+    "version": "1.0.0"
+  },
+  "servers": [{"url": "/internal/registration/v1"}],
+  "security": [{"internalBearer": []}],
+  "paths": {
+    "/availability": {"get": {"operationId": "registrationAvailability", "responses": {"200": {"description": "Registration service state"}}}},
+    "/jobs": {"post": {"operationId": "startRegistration", "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Registration session or batch started"}}}},
+    "/sessions": {"get": {"operationId": "listRegistrationSessions", "responses": {"200": {"description": "Session list"}}}},
+    "/sessions/{session_id}": {"get": {"operationId": "getRegistrationSession", "parameters": [{"$ref": "#/components/parameters/sessionId"}], "responses": {"200": {"description": "Session state"}, "404": {"description": "Not found"}}}},
+    "/sessions/{session_id}/stop": {"post": {"operationId": "stopRegistrationSession", "parameters": [{"$ref": "#/components/parameters/sessionId"}], "responses": {"200": {"description": "Session stopped"}}}},
+    "/batches/{batch_id}": {"get": {"operationId": "getRegistrationBatch", "parameters": [{"$ref": "#/components/parameters/batchId"}], "responses": {"200": {"description": "Batch state"}, "404": {"description": "Not found"}}}},
+    "/batches/{batch_id}/resume": {"post": {"operationId": "resumeRegistrationBatch", "parameters": [{"$ref": "#/components/parameters/batchId"}], "responses": {"200": {"description": "Batch resumed"}}}},
+    "/batches/{batch_id}/stop": {"post": {"operationId": "stopRegistrationBatch", "parameters": [{"$ref": "#/components/parameters/batchId"}], "responses": {"200": {"description": "Batch stopped"}}}},
+    "/reclaim": {"post": {"operationId": "reclaimRegistration", "responses": {"200": {"description": "Orphans reclaimed"}}}},
+    "/stop": {"post": {"operationId": "stopAllRegistration", "responses": {"200": {"description": "All active jobs stopped"}}}}
+  },
+  "components": {
+    "securitySchemes": {"internalBearer": {"type": "http", "scheme": "bearer"}},
+    "parameters": {
+      "sessionId": {"name": "session_id", "in": "path", "required": true, "schema": {"type": "string"}},
+      "batchId": {"name": "batch_id", "in": "path", "required": true, "schema": {"type": "string"}}
+    }
+  }
+}

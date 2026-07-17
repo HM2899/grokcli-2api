@@ -53,6 +53,8 @@ window.G2A = window.G2A || {};
   let accountsSort = "newest";
   // "" | "1" | "0" — server-side has_sso filter
   let accountsSsoFilter = "";
+  // "" | live|cooldown|disabled|quota_disabled|model_blocked|expired
+  let accountsStatusFilter = "";
   let selectedAccountIds = new Set();
   function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
   function headers(json = true) {
@@ -671,7 +673,7 @@ function rebindPageControls() {
     };
   }
   if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
-  if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+  if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { selectAllFilteredAccounts(); };
   if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
   if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
   if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
@@ -1291,6 +1293,86 @@ function fmtQuotaCell(p, liveQuota) {
 }
 
 
+
+const ACCOUNT_STATUS_FILTERS = [
+  { key: "", label: "全部", tone: "" },
+  { key: "live", label: "轮询中", tone: "ok" },
+  { key: "cooldown", label: "冷却中", tone: "warn" },
+  { key: "model_blocked", label: "模型封禁", tone: "warn" },
+  { key: "quota_disabled", label: "额度禁用", tone: "bad" },
+  { key: "disabled", label: "已禁用", tone: "bad" },
+  { key: "expired", label: "过期", tone: "bad" },
+];
+
+function accountStatusFilterLabel(key) {
+  const hit = ACCOUNT_STATUS_FILTERS.find((x) => x.key === (key || ""));
+  return hit ? hit.label : (key || "");
+}
+
+function setAccountStatusFilter(key, { reload = true } = {}) {
+  accountsStatusFilter = key || "";
+  try { localStorage.setItem("g2a_accounts_status_filter", accountsStatusFilter); } catch (_) {}
+  if ($("acc-filter-status")) {
+    try { $("acc-filter-status").value = accountsStatusFilter; } catch (_) {}
+  }
+  try { renderAccountStatusChips(); } catch (_) {}
+  if (reload) loadAccountsPage({ reset: true });
+}
+
+function renderAccountStatusChips() {
+  const el = $("acc-status-chips");
+  if (!el) return;
+  const cur = accountsStatusFilter || "";
+  el.innerHTML = ACCOUNT_STATUS_FILTERS.map((s) => {
+    const active = (s.key || "") === cur;
+    const cls = ["g2a-btn", "g2a-btn-sm", active ? "g2a-btn-primary" : "g2a-btn-default"].join(" ");
+    const title = s.key
+      ? `只显示「${s.label}」账号；点「筛选全选」可选中该状态下全部账号`
+      : "显示全部状态";
+    return `<button type="button" class="${cls}" data-acc-status="${esc(s.key)}" title="${esc(title)}">${esc(s.label)}</button>`;
+  }).join("");
+  el.querySelectorAll("[data-acc-status]").forEach((btn) => {
+    btn.onclick = () => setAccountStatusFilter(btn.getAttribute("data-acc-status") || "");
+  });
+}
+
+async function selectAllFilteredAccounts() {
+  const btn = $("btn-acc-select-all-filtered");
+  const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
+  const sort = accountsSort || "newest";
+  const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
+    ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
+    : "";
+  const statusQs = accountsStatusFilter
+    ? `&status=${encodeURIComponent(accountsStatusFilter)}`
+    : "";
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "选择中…";
+  }
+  try {
+    const data = await api(
+      `/accounts?page=1&page_size=20000&ids_only=1` +
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
+    );
+    const ids = Array.isArray(data.ids) && data.ids.length
+      ? data.ids
+      : (Array.isArray(data.accounts) ? data.accounts.map((a) => a && a.id).filter(Boolean) : []);
+    selectedAccountIds = new Set(ids.map(String));
+    try { renderAccountsPage(); } catch (_) {}
+    const st = accountStatusFilterLabel(accountsStatusFilter);
+    toast(`已选中筛选结果 ${selectedAccountIds.size} 个` + (st && st !== "全部" ? `（${st}）` : ""));
+  } catch (e) {
+    toast(e.message || "筛选全选失败", false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "筛选全选";
+    }
+  }
+}
+
 function getFilteredAccounts() {
   // Server-side filtering/pagination: accountsList holds current page rows.
   return accountsList.slice();
@@ -1302,10 +1384,18 @@ function updateAccountSelectionInfo(filteredCount, pageCount) {
   if (!el) return;
   const selected = selectedAccountIds.size;
   const q = (accountsSearchQuery || "").trim();
+  const st = (accountsStatusFilter || "").trim();
   const total = accountsTotal || accountsList.length;
-  el.textContent = q
-    ? `已选 ${selected} 个 · 匹配 ${total} · 本页 ${pageCount}`
-    : `已选 ${selected} 个 · 全部 ${total} · 本页 ${pageCount}`;
+  const stLabel = (typeof accountStatusFilterLabel === "function") ? accountStatusFilterLabel(st) : st;
+  const bits = [`已选 ${selected} 个`];
+  if (q || st || accountsSsoFilter) bits.push(`筛选 ${total}`);
+  else bits.push(`全部 ${total}`);
+  bits.push(`本页 ${pageCount}`);
+  if (stLabel && st) bits.push(`状态:${stLabel}`);
+  if (accountsSsoFilter === "1") bits.push("有SSO");
+  if (accountsSsoFilter === "0") bits.push("无SSO");
+  if (q) bits.push(`关键词:${q}`);
+  el.textContent = bits.join(" · ");
   const pageCheck = $("acc-check-page");
   if (pageCheck) {
     const pageIds = Array.from(document.querySelectorAll(".acc-check-one")).map(x => x.dataset.id);
@@ -1333,49 +1423,7 @@ function renderAccountsPage() {
     tbody.innerHTML = pageItems.map((a) => {
       const p = a._pool || { id: a.id };
       const enabled = p.enabled !== false;
-      const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
-      const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
-      const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
-      const quotaOff = p.disabled_for_quota;
-      const expired = !!(
-        p.pool_status === "expired"
-        || a.expired
-        || p.token_expired_at
-        || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
-      );
-      const renewFails = Number(p.renew_fail_count || 0) || 0;
-      const streak = Number(p.consecutive_fails || 0) || 0;
-      const cdCode = p.cooldown_code || "";
-      const cdModel = p.cooldown_model || "";
-      const cdTok = (p.cooldown_tokens_actual != null && p.cooldown_tokens_limit != null)
-        ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
-      let poolLabel;
-      if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
-      else if (expired) {
-        const tip = [
-          "已过期，已移出轮询",
-          renewFails ? `续期失败×${renewFails}` : "",
-          p.last_renew_error || p.token_expired_reason || p.last_error || "",
-          p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
-          p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
-        ].filter(Boolean).join(" · ");
-        poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
-      }
-      else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
-      else if (cooling) {
-        const n = cdCount > 0 ? cdCount : 1;
-        const tip = [
-          "冷却中",
-          n > 1 ? `叠加×${n}` : "",
-          cdCode ? `code=${cdCode}` : "",
-          cdModel ? `model=${cdModel}` : "",
-          cdTok ? `tokens ${cdTok}` : "",
-          "单次测活成功即恢复正常",
-        ].filter(Boolean).join(" · ");
-        poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
-      }
-      else if (streak >= 2) poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
-      else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+      const poolLabel = poolStatusLabel(a, p);
       const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
       const refreshPill = a.has_refresh_token
         ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
@@ -1457,16 +1505,20 @@ async function loadAccountsPage({ reset = false } = {}) {
   accountsSearchQuery = q;
   if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
   if ($("acc-filter-sso")) accountsSsoFilter = $("acc-filter-sso").value || "";
+  if ($("acc-filter-status")) accountsStatusFilter = $("acc-filter-status").value || accountsStatusFilter || "";
   const sort = accountsSort || "newest";
   const pageSize = accountsPageSize || 25;
   const page = accountsPage || 1;
   const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
     ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
     : "";
+  const statusQs = accountsStatusFilter
+    ? `&status=${encodeURIComponent(accountsStatusFilter)}`
+    : "";
   try {
     const data = await api(
       `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}`
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
     );
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
@@ -1506,6 +1558,7 @@ async function loadAccountsPage({ reset = false } = {}) {
       "store", window.__g2aAccountsStore.source
     );
     accountsLoading = false;
+    try { renderAccountStatusChips(); } catch (_) {}
     renderAccountsPage();
     hydrateQuotaCacheFromDB();
   } catch (e) {
@@ -1602,35 +1655,7 @@ function renderOneAccountRow(account) {
   const a = account;
   const p = a._pool || { id: a.id };
   const enabled = p.enabled !== false;
-  const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
-  const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
-  const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
-  const quotaOff = p.disabled_for_quota;
-  const expired = !!(
-    p.pool_status === "expired"
-    || a.expired
-    || p.token_expired_at
-    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
-  );
-  const renewFails = Number(p.renew_fail_count || 0) || 0;
-  let poolLabel;
-  if (quotaOff) poolLabel = '<span class="g2a-tag bad">额度禁用</span>';
-  else if (expired) {
-    const tip = [
-      "已过期，已移出轮询",
-      renewFails ? `续期失败×${renewFails}` : "",
-      p.last_renew_error || p.token_expired_reason || p.last_error || "",
-      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
-    ].filter(Boolean).join(" · ");
-    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
-  }
-  else if (!enabled) poolLabel = '<span class="g2a-tag bad">已禁用</span>';
-  else if (cooling) {
-    const n = cdCount > 0 ? cdCount : 1;
-    const tip = n > 1 ? `冷却中 · 叠加×${n} · 单次测活成功即恢复` : "冷却中 · 单次测活成功即恢复";
-    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
-  }
-  else poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+  const poolLabel = poolStatusLabel(a, p);
   const usage = `${p.success_count || 0}√ / ${p.fail_count || 0}× · 共 ${p.request_count || 0}`;
   const refreshPill = a.has_refresh_token
     ? '<span class="g2a-tag ok" title="可自动 refresh">可自动续期</span>'
@@ -2014,7 +2039,7 @@ if ($("acc-search")) {
   });
 }
 if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
-if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { selectAllFilteredAccounts(); };
 if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => {
   selectedAccountIds.clear();
   renderAccountsPage();
@@ -2027,9 +2052,86 @@ if ($("acc-check-page")) {
   on("acc-check-page", "onchange", (e) => setPageSelection(!!e.target.checked));
 }
 
+
+function poolStatusLabel(a, p) {
+  const enabled = p.enabled !== false;
+  const stackLen = Array.isArray(p.status_stack) ? p.status_stack.length : 0;
+  const cdCount = Number(p.cooldown_count || stackLen || 0) || 0;
+  const cooling = !!(p.in_cooldown || cdCount > 0 || stackLen > 0 || p.pool_status === "cooldown");
+  const quotaOff = !!p.disabled_for_quota || p.pool_status === "quota_disabled";
+  const blockedIds = Array.isArray(p.blocked_model_ids)
+    ? p.blocked_model_ids
+    : (p.blocked_models && typeof p.blocked_models === "object" ? Object.keys(p.blocked_models) : []);
+  const modelBlocked = blockedIds.length > 0 || p.pool_status === "model_blocked";
+  const expired = !!(
+    p.pool_status === "expired"
+    || a.expired
+    || p.token_expired_at
+    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
+  );
+  const renewFails = Number(p.renew_fail_count || 0) || 0;
+  const streak = Number(p.consecutive_fails || 0) || 0;
+  const cdCode = p.cooldown_code || "";
+  const cdModel = p.cooldown_model || "";
+  const cdTok = (p.cooldown_tokens_actual != null && p.cooldown_tokens_limit != null)
+    ? `${p.cooldown_tokens_actual}/${p.cooldown_tokens_limit}` : "";
+  let poolLabel;
+  if (quotaOff) {
+    const tip = [p.disabled_reason || "额度耗尽，已移出轮询", p.quota_source ? `source=${p.quota_source}` : ""].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">额度禁用</span>`;
+  } else if (expired) {
+    const tip = [
+      "已过期，已移出轮询",
+      renewFails ? `续期失败×${renewFails}` : "",
+      p.last_renew_error || p.token_expired_reason || p.last_error || "",
+      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
+      p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
+  } else if (!enabled || p.pool_status === "disabled") {
+    const tip = p.disabled_reason || p.last_error || "已禁用，不参与轮询";
+    poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">已禁用</span>`;
+  } else if (cooling) {
+    const n = cdCount > 0 ? cdCount : 1;
+    const tip = [
+      "冷却中",
+      n > 1 ? `叠加×${n}` : "",
+      cdCode ? `code=${cdCode}` : "",
+      cdModel ? `model=${cdModel}` : "",
+      cdTok ? `tokens ${cdTok}` : "",
+      "单次测活成功即恢复正常",
+    ].filter(Boolean).join(" · ");
+    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">冷却中</span>`;
+  } else if (modelBlocked) {
+    const tip = [
+      "模型封禁（账号仍可轮询其他模型）",
+      blockedIds.length ? blockedIds.join(", ") : "",
+      p.last_error || "",
+    ].filter(Boolean).join(" · ");
+    const short = blockedIds.length <= 2
+      ? blockedIds.join(",")
+      : `${blockedIds.slice(0, 2).join(",")}…+${blockedIds.length - 2}`;
+    poolLabel = `<span class="g2a-tag warn" title="${esc(tip)}">模型封禁${short ? " · " + esc(short) : ""}</span>`;
+  } else if (streak >= 2) {
+    poolLabel = `<span class="g2a-tag warn">轮询中 · 连败${streak}</span>`;
+  } else {
+    poolLabel = '<span class="g2a-tag ok">轮询中</span>';
+  }
+  return poolLabel;
+}
+
 function fmtProbeCell(lastProbe, lastError, blockedIds) {
+  const ids = Array.isArray(blockedIds) ? blockedIds.filter(Boolean) : [];
+  const blocked = ids.length
+    ? `<div class="g2a-tag warn" title="${esc("模型封禁: " + ids.join(", "))}" style="margin-top:4px">屏蔽 ${esc(ids.length <= 2 ? ids.join(", ") : ids.slice(0, 2).join(", ") + "…")}</div>`
+    : "";
   const lp = lastProbe || null;
   if (!lp) {
+    if (blocked) {
+      return blocked + (lastError
+        ? `<div class="g2a-muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>`
+        : "");
+    }
     const err = lastError
       ? `<div class="g2a-muted" title="${esc(lastError)}" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lastError).slice(0, 48))}</div>`
       : '<span class="g2a-muted">未探测</span>';
@@ -2039,9 +2141,6 @@ function fmtProbeCell(lastProbe, lastError, blockedIds) {
   const pill = ok ? '<span class="g2a-tag ok">正常</span>' : '<span class="g2a-tag bad">报错</span>';
   const model = lp.model ? `<span class="mono">${esc(lp.model)}</span>` : "";
   const when = lp.probed_at ? fmtTime(lp.probed_at) : "";
-  const blocked = (blockedIds && blockedIds.length)
-    ? `<div class="g2a-muted">屏蔽: ${esc(blockedIds.join(", "))}</div>`
-    : "";
   const err = (!ok && lp.error)
     ? `<div class="g2a-muted" title="${esc(lp.error)}" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(String(lp.error).slice(0, 60))}</div>`
     : "";
@@ -2329,21 +2428,58 @@ async function runProbeAll() {
   toast("已开始全部账号模型探测，请稍候…");
   setLogPanel(
     "probe-result",
-    "正在探测全部账号模型…\n（后台执行中，完成后自动刷新列表）",
+    "正在探测全部账号模型…\n（多波次后台执行，完成后自动刷新列表）",
     { forceShow: true }
   );
   try {
-    const r = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    // Async multi-wave job: returns immediately, then we poll /model-health.
+    const start = await api("/accounts/probe-all", { method: "POST", body: "{}" });
+    let r = start;
+    const pollDeadline = Date.now() + 35 * 60 * 1000;
+    while (true) {
+      const job = (r && r.running != null) ? r : ((r && r.job) || r);
+      const running = !!(job && job.running);
+      const wave = job && (job.wave || job.waves) || 0;
+      const probed = job && (job.probed || job.count) || 0;
+      const avail = job && (job.available_count ?? job.available) || 0;
+      const failed = job && (job.unavailable_count ?? job.failed) || 0;
+      const rem = job && job.sweep && job.sweep.remaining;
+      const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      const progressLines = [
+        running ? `全部账号模型探测进行中（${elapsed}s）` : `全部账号模型探测完成（${elapsed}s）`,
+        wave ? `波次 ${wave}` : null,
+        `已探测 ${probed}` + (rem != null ? ` · 剩余 ${rem}` : (job && job.deferred ? ` · 延后 ${job.deferred}` : "")),
+        `可用 ${avail}` + (failed ? ` · 不可用 ${failed}` : ""),
+        job && job.models ? `模型 ${(job.models || []).join(", ")}` : null,
+      ].filter(Boolean);
+      setLogPanel("probe-result", progressLines.join("\n"), { forceShow: true });
+      if (!running) {
+        r = job || r;
+        break;
+      }
+      if (Date.now() > pollDeadline) {
+        throw new Error("探测超时（>35min），请查看 model-health 状态");
+      }
+      await new Promise((res) => setTimeout(res, 2000));
+      try {
+        const st = await api("/model-health");
+        r = (st && st.job) ? st.job : (st && st.last) ? st.last : st;
+        if (st && st.sweep && r && !r.sweep) r.sweep = st.sweep;
+      } catch (_) {
+        // keep looping on transient errors
+      }
+    }
     const elapsed = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     const lines = [
       `全部账号模型探测完成（${elapsed}s）`,
-      `探测账号 ${r.count ?? 0}` + (r.deferred ? ` · 延后 ${r.deferred}` : ""),
-      `可用 ${r.available_count ?? 0}/${r.count ?? 0}`,
-      `不可用 ${r.unavailable_count ?? 0}`,
+      `探测 ${r.probed ?? r.count ?? 0}` + (r.deferred ? ` · 延后 ${r.deferred}` : ""),
+      `可用 ${r.available_count ?? r.available ?? 0}/${r.count ?? r.probed ?? 0}`,
+      `不可用 ${r.unavailable_count ?? r.failed ?? 0}`,
       `自动处理 ${r.auto_action_count ?? 0}` + (r.kick_cooldown ? ` · 进入冷却 ${r.kick_cooldown}` : ""),
-      `模型 ${(r.models || []).join(", ") || "—"}`,
-    ];
-    const bad = (r.results || []).filter((x) => !x.available);
+      r.waves ? `波次 ${r.waves}` : null,
+      `模型 ${((r.models || []).join(", ") || "—")}`,
+    ].filter(Boolean);
+    const bad = (r.failed_sample || r.results || []).filter((x) => x && !x.available);
     bad.slice(0, 8).forEach((x) => {
       let err = String(x.error || "error");
       if (/free-usage-exhausted|free usage/i.test(err)) {
@@ -2354,8 +2490,7 @@ async function runProbeAll() {
       lines.push(`- ${x.email || x.account_id}: ${err}`);
     });
     setLogPanel("probe-result", lines.join("\n"), { forceShow: true });
-    toast(`探测完成：${r.available_count ?? 0}/${r.count ?? 0} 可用`);
-    // Immediately reflect latest probe cycle on overview text.
+    toast(`探测完成：${r.available_count ?? r.available ?? 0}/${r.count ?? r.probed ?? 0} 可用`);
     statusCache = statusCache || {};
     dashCache = dashCache || {};
     const mh = Object.assign({}, statusCache.model_health || {}, {
@@ -4775,6 +4910,20 @@ async function runJsonExportJob({ mode = "all", ids = [], buttonId = "btn-export
     } else {
       started = await api("/accounts/export?async_job=1");
     }
+    // Sync fallback for older servers: if payload returned directly, download it.
+    if (started && started.auth && !started.job_id) {
+      const blob = new Blob([JSON.stringify(started, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = mode === "selected"
+        ? `grok2api-auth-export-selected-${selectedN}.json`
+        : "grok2api-auth-export.json";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      setJsonIoProgress({ percent: 100, label: "导出完成", detail: a.download, done: started.count || selectedN || 0, total: started.count || selectedN || 0, success: started.count || 0, fail: 0, status: "done" });
+      toast(`已导出 ${started.count || selectedN || ""} 个账号`);
+      return;
+    }
     const jobId = started && started.job_id;
     if (!jobId) throw new Error("未返回 job_id，无法跟踪导出进度");
     setJsonIoProgress({
@@ -6695,11 +6844,13 @@ async function loadUsageEvents({ reset = false } = {}) {
   $("usage-events-tbody").innerHTML = `<tr><td colspan="14" class="g2a-muted">加载明细中…</td></tr>`;
   if ($("usage-events-info")) $("usage-events-info").textContent = "查询中…";
   try {
+    // Backend stores chat as openai_chat; keep UI label "openai".
+    const protocolFilter = protocol === "openai" ? "openai_chat" : protocol;
     const params = new URLSearchParams({
       page: String(usageEventsPage),
       page_size: String(usageEventsPageSize),
       q,
-      protocol,
+      protocol: protocolFilter,
       ok,
     });
     const data = await api("/usage/events?" + params.toString());
@@ -7140,8 +7291,13 @@ async function loadAdminLogs({ reset = false } = {}) {
 
 window.G2AAdmin = { bootstrap, loadDashboard, api, $, toast, PAGE_META, renderAccounts, renderKeys };
   if (document.body && document.body.dataset.page) {
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => bootstrap());
-    else bootstrap();
+    const _boot = () => {
+      try { if (document.body.dataset.page === "accounts") renderAccountStatusChips(); } catch (_) {}
+      bootstrap();
+    };
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", _boot);
+    else _boot();
   }
 })();
 /* g2a-cache-bust-20260715-reg-restore-fix */
+

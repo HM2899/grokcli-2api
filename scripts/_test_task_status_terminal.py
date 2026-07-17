@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def _parse_sse(frames: list[str]) -> list[dict]:
@@ -604,16 +609,9 @@ def test_update_to_edit_remap_all_paths():
     assert anames and all(n == "Edit" for n in anames), anames
 
     # 6) OpenAI chat outbound builder
-    import sys
     import importlib
 
-    # Force the container app package, not a stale /tmp/app.py copy.
-    sys.path = [p for p in sys.path if p not in ("/tmp", "") and not str(p).endswith("/tmp")]
-    if "/app" in sys.path:
-        sys.path.remove("/app")
-    sys.path.insert(0, "/app")
-    sys.modules.pop("app", None)
-    application = importlib.import_module("app")
+    application = importlib.import_module("grok2api.app")
 
     # Bind allow-list like chat_completions does
     try:
@@ -738,9 +736,7 @@ def test_codex_reasoning_not_leaked_as_output_text():
     import re
     from pathlib import Path
 
-    app_src = Path("/app/app.py")
-    if not app_src.exists():
-        app_src = Path(__file__).resolve().parent.parent / "app.py"
+    app_src = ROOT / "grok2api" / "app.py"
     src = app_src.read_text(encoding="utf-8")
     assert "reasoning_as_text" not in src, "reasoning_as_text path must be removed"
     # Mid-stream must not call on_text_delta(reasoning)

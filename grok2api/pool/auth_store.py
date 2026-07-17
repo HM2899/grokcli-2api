@@ -23,9 +23,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from grok2api.config import AUTH_FILE
+from grok2api.config import AUTH_FILE, STORE_BACKEND
 
 _thread_lock = threading.RLock()
+
+
+def _hybrid_mode() -> bool:
+    return str(STORE_BACKEND or "hybrid").strip().lower() != "file"
+
+
+def _raise_hybrid_store_error(operation: str) -> None:
+    raise RuntimeError(
+        f"PostgreSQL {operation} failed in hybrid mode; refusing file fallback "
+        "to prevent split-brain data"
+    )
 
 # In-process read cache (invalidated on write / mtime change)
 _cache_lock = threading.RLock()
@@ -99,15 +110,6 @@ def auth_lock(timeout: float = 10.0) -> Iterator[None]:
     with _thread_lock:
         with _file_lock(AUTH_FILE, timeout=timeout):
             yield
-
-
-def _invalidate_live_credentials_cache() -> None:
-    try:
-        from grok2api.pool.auth import invalidate_live_credentials_cache
-
-        invalidate_live_credentials_cache()
-    except Exception:
-        pass
 
 
 def _invalidate_live_credentials_cache() -> None:
@@ -201,10 +203,9 @@ def read_auth_map(path: Path | None = None) -> dict[str, Any]:
     if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
         pg = _pg_accounts()
         if pg is not None:
-            try:
-                return pg.read_auth_map()
-            except Exception:
-                pass  # fall through to file
+            return pg.read_auth_map()
+        if _hybrid_mode():
+            _raise_hybrid_store_error("account read")
 
     # Fast path: cache hit without taking file lock (safe for read-mostly)
     cached = _cached_read(path)
@@ -243,12 +244,9 @@ def read_auth_entry(
     if path == AUTH_FILE or path.resolve() == AUTH_FILE.resolve():
         pg = _pg_accounts()
         if pg is not None:
-            try:
-                hit = pg.read_auth_entry(aid)
-                if hit is not None:
-                    return hit
-            except Exception:
-                pass  # fall through to full map / file
+            return pg.read_auth_entry(aid)
+        if _hybrid_mode():
+            _raise_hybrid_store_error("account entry read")
     data = read_auth_map(path)
     if not isinstance(data, dict) or not data:
         return None
@@ -306,6 +304,8 @@ def write_auth_map(data: dict[str, Any], path: Path | None = None) -> None:
             pg.write_auth_map(data)
             _invalidate_cache(path)
             return
+        if _hybrid_mode():
+            _raise_hybrid_store_error("full account write")
     with auth_lock():
         _write_auth_file(data, path)
 
@@ -320,6 +320,8 @@ def mutate_auth_map(mutator) -> dict[str, Any]:
         data = pg.mutate_auth_map(mutator)
         _invalidate_cache(AUTH_FILE)
         return data
+    if _hybrid_mode():
+        _raise_hybrid_store_error("account mutation")
     with auth_lock():
         path = AUTH_FILE
         data: dict[str, Any] = {}
@@ -346,14 +348,13 @@ def upsert_auth_entry(
         return account_id or ""
     pg = _pg_accounts()
     if pg is not None:
-        try:
-            pg.upsert_account_merged(
-                account_id, entry, merge_same_user=merge_same_user
-            )
-            _invalidate_cache(AUTH_FILE)
-            return account_id
-        except Exception:
-            pass
+        pg.upsert_account_merged(
+            account_id, entry, merge_same_user=merge_same_user
+        )
+        _invalidate_cache(AUTH_FILE)
+        return account_id
+    if _hybrid_mode():
+        _raise_hybrid_store_error("account upsert")
 
     def _mut(data: dict[str, Any]) -> None:
         uid = entry.get("user_id") or entry.get("principal_id")

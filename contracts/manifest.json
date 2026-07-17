@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "oracle": {
+    "implementation": "python",
+    "version": "1.9.91"
+  },
+  "routes": [
+    {"method": "GET", "paths": ["/live", "/ready"], "protocol": "process_probe", "go_phase": "baseline"},
+    {"method": "GET", "paths": ["/health", "/metrics", "/", "/admin", "/admin/{page}", "/static/{path}"], "protocol": "read_only_shell", "go_phase": "baseline"},
+    {"method": "GET", "paths": ["/v1/models", "/models"], "protocol": "openai", "go_phase": "public_read"},
+    {"method": "POST", "paths": ["/v1/chat/completions", "/chat/completions"], "protocol": "openai_chat", "go_phase": "chat"},
+    {"method": "POST", "paths": ["/v1/messages", "/messages"], "protocol": "anthropic_messages", "go_phase": "messages"},
+    {"method": "POST", "paths": ["/v1/messages/count_tokens", "/messages/count_tokens"], "protocol": "anthropic_count_tokens", "go_phase": "messages"},
+    {"method": "POST", "paths": ["/v1/responses", "/responses"], "protocol": "openai_responses", "go_phase": "responses"}
+  ],
+  "admin_routes": {
+    "read": ["/admin/api/status", "/admin/api/dashboard", "/admin/api/keys", "/admin/api/accounts", "/admin/api/settings", "/admin/api/models", "/admin/api/logs", "/admin/api/usage"],
+    "write_except_registration": ["/admin/api/keys", "/admin/api/settings", "/admin/api/accounts", "/admin/api/model-health"],
+    "registration_boundary": "Go may call the external /internal/registration/v1 service and consume results; Go must not reimplement captcha/browser/email registration execution."
+  },
+  "authentication": {
+    "headers": ["Authorization: Bearer", "x-api-key"],
+    "precedence": ["Authorization: Bearer", "x-api-key"]
+  },
+  "readiness": {
+    "startup": "Go app verifies PostgreSQL connectivity and applied migration checksums before /ready succeeds.",
+    "fail_closed": "If shared stores, store backend, or migrations are not safe, /live stays up, /ready is 503, and mutating routes must be disabled.",
+    "no_auto_migrate": "Application startup verifies only; schema changes are applied exclusively by grok2api-migrate."
+  },
+  "data_safety": {
+    "durable_source": "PostgreSQL",
+    "redis_role": "hot state, TTL state, locks, sessions, and affinity only",
+    "forbidden_go_write_pattern": "full-table or full-map replacement for accounts, api_keys, account_pool, models, or settings",
+    "required_write_pattern": "row-level upsert/patch/delete with ownership and idempotency checks where applicable",
+    "api_key_secret": "enc:v1: ciphertext must be preserved unless Go can decrypt/re-encrypt with the configured secret material"
+  },
+  "stream_invariants": {
+    "openai_chat": ["terminal finish chunk", "data: [DONE]"],
+    "anthropic_messages": ["dense content block indexes", "message_delta before message_stop", "tool_use stop only after emitted tool block"],
+    "openai_responses": ["monotonic sequence_number from zero", "response.created before terminal", "response.completed or response.failed", "data: [DONE]"]
+  },
+  "failover": {
+    "allowed": "before the first committed model content or tool payload; protocol envelopes may already be open",
+    "forbidden": "after committed model content or tool payload"
+  },
+  "nondeterministic_fields": [
+    "$.id",
+    "$.created",
+    "$.created_at",
+    "$.output[*].id",
+    "$.output[*].call_id"
+  ]
+}

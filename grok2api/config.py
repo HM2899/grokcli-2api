@@ -287,23 +287,28 @@ def _env_url(*names: str, default: str = "") -> str:
     return default
 
 
-DATABASE_URL = _env_url(
-    "GROK2API_DATABASE_URL",
-    "DATABASE_URL",
-    default="postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api",
-)
-REDIS_URL = _env_url(
-    "GROK2API_REDIS_URL",
-    "REDIS_URL",
-    default="redis://127.0.0.1:6379/0",
-)
-
 _store_backend_raw = (os.getenv("GROK2API_STORE_BACKEND") or "hybrid").strip().lower()
 if _store_backend_raw == "file":
     # Explicit escape hatch only — not recommended; multi-worker will refuse.
     STORE_BACKEND = "file"
 else:
     STORE_BACKEND = "hybrid"
+
+# File mode must not opportunistically connect to localhost shared stores. An
+# explicit URL still opts in for migration tooling, but an absent URL remains
+# absent instead of inheriting the hybrid localhost default.
+_store_url_default = "" if STORE_BACKEND == "file" else "postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api"
+_redis_url_default = "" if STORE_BACKEND == "file" else "redis://127.0.0.1:6379/0"
+DATABASE_URL = _env_url(
+    "GROK2API_DATABASE_URL",
+    "DATABASE_URL",
+    default=_store_url_default,
+)
+REDIS_URL = _env_url(
+    "GROK2API_REDIS_URL",
+    "REDIS_URL",
+    default=_redis_url_default,
+)
 
 # Maintainer leader: only one process runs token_maintainer + model_health.
 # auto: elect via Redis (required in high-concurrency mode).

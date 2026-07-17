@@ -684,16 +684,23 @@ def save_account_pool_state(state: dict[str, Any]) -> None:
         pass
     pg = _pg_settings()
     if pg is not None:
-        try:
-            pg.save_account_pool_state(state if isinstance(state, dict) else {})
-            # keep in-process mem coherent
-            with _lock:
-                data = _load()
-                data["account_pool"] = state
-                data["updated_at"] = time.time()
-            return
-        except Exception:
-            pass
+        pg.save_account_pool_state(state if isinstance(state, dict) else {})
+        # keep in-process mem coherent
+        with _lock:
+            data = _load()
+            data["account_pool"] = state
+            data["updated_at"] = time.time()
+        return
+    try:
+        from grok2api.config import STORE_BACKEND
+
+        if str(STORE_BACKEND or "hybrid").strip().lower() != "file":
+            raise RuntimeError(
+                "PostgreSQL pool write failed in hybrid mode; refusing file "
+                "fallback to prevent split-brain data"
+            )
+    except ImportError:
+        pass
     with _lock:
         data = _load()
         data["account_pool"] = state

@@ -58,6 +58,27 @@ def replace_all(keys: list[dict[str, Any]]) -> None:
         conn.commit()
 
 
+def insert(key: dict[str, Any]) -> None:
+    """Insert one key without replacing a concurrently-created key set."""
+    if not enabled():
+        return
+    encrypted = _encrypted_record(key)
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO api_keys (
+                  id, name, prefix, key_hash, secret, enabled, note,
+                  created_at, last_used_at, request_count
+                ) VALUES (
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                _record_values(encrypted),
+            )
+        conn.commit()
+
+
 def upsert(key: dict[str, Any]) -> None:
     if not enabled():
         return
@@ -126,13 +147,32 @@ def find_by_hash(key_hash: str) -> dict[str, Any] | None:
     }
 
 
-def _upsert(cur, k: dict[str, Any]) -> None:
+def _encrypted_record(k: dict[str, Any]) -> dict[str, Any]:
     try:
         from grok2api.store.crypto import maybe_encrypt_key_record
 
-        k = maybe_encrypt_key_record(k)
+        return maybe_encrypt_key_record(k)
     except Exception:
-        pass
+        return k
+
+
+def _record_values(k: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        k.get("id"),
+        k.get("name") or "unnamed",
+        k.get("prefix") or "",
+        k.get("key_hash"),
+        k.get("secret"),
+        bool(k.get("enabled", True)),
+        k.get("note") or "",
+        _ts(k.get("created_at") or time.time()),
+        _ts(k.get("last_used_at")),
+        int(k.get("request_count") or 0),
+    )
+
+
+def _upsert(cur, k: dict[str, Any]) -> None:
+    k = _encrypted_record(k)
     cur.execute(
         """
         INSERT INTO api_keys (
@@ -151,16 +191,5 @@ def _upsert(cur, k: dict[str, Any]) -> None:
           last_used_at = EXCLUDED.last_used_at,
           request_count = EXCLUDED.request_count
         """,
-        (
-            k.get("id"),
-            k.get("name") or "unnamed",
-            k.get("prefix") or "",
-            k.get("key_hash"),
-            k.get("secret"),
-            bool(k.get("enabled", True)),
-            k.get("note") or "",
-            _ts(k.get("created_at") or time.time()),
-            _ts(k.get("last_used_at")),
-            int(k.get("request_count") or 0),
-        ),
+        _record_values(k),
     )

@@ -1,0 +1,67 @@
+name: Compatibility contracts
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install oracle dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Validate contract manifests
+        run: |
+          python -m pip install jsonschema
+          python -m json.tool contracts/env-manifest.json >/dev/null
+          python - <<'PY'
+          import json, pathlib
+          import jsonschema
+          root = pathlib.Path("contracts")
+          schema = json.loads((root / "manifest.schema.json").read_text())
+          manifest = json.loads((root / "manifest.json").read_text())
+          jsonschema.validate(manifest, schema)
+          PY
+      - name: Run Python regression oracle
+        run: python scripts/run_regressions.py
+
+  go-foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Verify formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Run Go vet
+        run: go vet ./...
+      - name: Run Go tests
+        run: go test ./...
+      - name: Run Go race tests
+        run: go test -race ./...
+      - name: Build migration-safe binary
+        run: go build ./cmd/grok2api
+      - name: Gate Python and Go versions match
+        run: |
+          python - <<'PY'
+          import pathlib, re
+          py = pathlib.Path("grok2api/app.py").read_text(encoding="utf-8")
+          go = pathlib.Path("internal/buildinfo/buildinfo.go").read_text(encoding="utf-8")
+          pv = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', py).group(1)
+          gv = re.search(r'Version\s*=\s*"([^"]+)"', go).group(1)
+          assert pv == gv, (pv, gv)
+          PY
