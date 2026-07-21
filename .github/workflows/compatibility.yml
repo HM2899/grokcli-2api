@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
       - name: Validate contract manifests
         run: |
-          python -m pip install -q jsonschema
+          python -m pip install -q jsonschema requests
           python -m json.tool contracts/env-manifest.json >/dev/null
           python - <<'PY2'
           import json, pathlib
