@@ -4484,6 +4484,32 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// sharedRegistrationBulkHTTP is isolated from high-frequency status polling.
+// A durable list with thousands of sessions can take seconds to serialize and
+// transfer even over the loopback sidecar connection.
+var (
+	regHTTPBulkClientOnce sync.Once
+	regHTTPBulkClient     *http.Client
+)
+
+func sharedRegistrationBulkHTTP() *http.Client {
+	regHTTPBulkClientOnce.Do(func() {
+		regHTTPBulkClient = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: time.Second}).DialContext,
+				MaxIdleConns:          8,
+				MaxIdleConnsPerHost:   4,
+				MaxConnsPerHost:       4,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 15 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPBulkClient
+}
+
 // sharedRegistrationLongHTTP is used for long-running POST operations
 // (job creation, device login, SSO import) that may take ~30s+ due to
 // turnstile solving and email roundtrips (e.g. Cloud Mail registration
@@ -4536,6 +4562,7 @@ func registrationClient(options Options) *regclient.Client {
 		Token:    token,
 		HTTP:     sharedRegistrationHTTP(),
 		HTTPLong: sharedRegistrationLongHTTP(),
+		HTTPBulk: sharedRegistrationBulkHTTP(),
 	}
 	return regClientCache
 }
