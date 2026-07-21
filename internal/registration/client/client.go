@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const APIVersion = "v1"
+const (
+	APIVersion                 = "v1"
+	maxResponseBodyBytes int64 = 32 << 20
+)
 
 type Client struct {
 	BaseURL string
@@ -164,9 +167,12 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 		return nil, err
 	}
 	defer response.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(payload)) > maxResponseBodyBytes {
+		return nil, fmt.Errorf("registration service response exceeds %d MiB", maxResponseBodyBytes>>20)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var envelope map[string]any
