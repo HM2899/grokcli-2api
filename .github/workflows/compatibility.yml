@@ -36,6 +36,8 @@ jobs:
           assert runtime["values"] == ["go"], runtime
           print("contracts ok", manifest.get("oracle", {}).get("version"))
           PY2
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -p "test_*.py"
 
   go-foundation:
     runs-on: ubuntu-latest
