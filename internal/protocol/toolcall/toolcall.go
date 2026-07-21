@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 var nonName = regexp.MustCompile(`[^a-z0-9_]+`)
@@ -189,7 +192,40 @@ func canonicalArgKeyForTool(key, toolName string) string {
 			return alias
 		}
 	}
+	// Grep/Glob (Claude Code): schema uses path + pattern, NOT file_path.
+	// Global aliases map path→file_path for Read/Edit, which makes Grep reject with
+	// "An unexpected parameter file_path was provided".
+	if isGrepLikeTool(toolName) {
+		switch folded {
+		case "path", "filepath", "file_path", "file", "filename", "file_name",
+			"target_file", "targetfile", "targetpath", "target_path", "target":
+			return "path"
+		case "search", "query", "q", "search_query", "searchquery":
+			// required["grep"] is pattern; Grok often emits search/query instead.
+			return "pattern"
+		}
+		if alnum == "filepath" || alnum == "filename" || alnum == "targetfile" || alnum == "targetpath" {
+			return "path"
+		}
+		if alnum == "searchquery" {
+			return "pattern"
+		}
+	}
 	return canonicalArgKey(key)
+}
+
+// isGrepLikeTool is true for Claude Code Grep / Glob and common aliases.
+// These tools accept path (directory/file scope), not file_path.
+func isGrepLikeTool(name string) bool {
+	key := nameKey(name)
+	switch key {
+	case "grep", "glob", "searchfiles", "search_files", "rg", "ripgrep":
+		return true
+	}
+	if strings.HasSuffix(key, "grep") || strings.HasSuffix(key, "glob") {
+		return true
+	}
+	return false
 }
 
 func isEditTool(name string) bool {
@@ -434,7 +470,47 @@ func applyEditDefaults(obj map[string]any, toolName string) map[string]any {
 		// before Grok finished streaming the real replacement, then drop the
 		// late args (tool already stopped) — intermittent Update failures.
 	}
+	obj = applyGrepDefaults(obj, toolName)
 	return applyShellDefaults(obj, toolName)
+}
+
+// applyGrepDefaults rewrites Read/Edit-style path keys onto Claude Code Grep/Glob
+// schema (path + pattern) and drops file_path so clients stop rejecting with
+// "An unexpected parameter file_path was provided".
+func applyGrepDefaults(obj map[string]any, toolName string) map[string]any {
+	if obj == nil || !isGrepLikeTool(toolName) {
+		return obj
+	}
+	// file_path / leftovers → path
+	if v, ok := obj["path"]; !ok || empty(v) {
+		for _, alt := range []string{"file_path", "filepath", "file", "target_file", "targetfile"} {
+			if av, exists := obj[alt]; exists && !empty(av) {
+				obj["path"] = unwrapPathValue(av)
+				break
+			}
+		}
+	} else {
+		obj["path"] = unwrapPathValue(v)
+	}
+	for _, alt := range []string{"file_path", "filepath", "file", "target_file", "targetfile"} {
+		delete(obj, alt)
+	}
+	// search/query → pattern (required field for Grep)
+	if v, ok := obj["pattern"]; !ok || empty(v) {
+		for _, alt := range []string{"query", "search", "q", "search_query", "regex"} {
+			if av, exists := obj[alt]; exists && !empty(av) {
+				obj["pattern"] = av
+				break
+			}
+		}
+	}
+	// Drop query/search when pattern is set so clients never see dual keys.
+	if _, has := obj["pattern"]; has && !empty(obj["pattern"]) {
+		for _, alt := range []string{"query", "search", "q", "search_query"} {
+			delete(obj, alt)
+		}
+	}
+	return obj
 }
 
 // recoverEditPoisonedKeys remaps leftover Grep/generic aliases onto Edit schema
@@ -657,6 +733,17 @@ func applyShellDefaults(obj map[string]any, toolName string) map[string]any {
 	return obj
 }
 
+// emptyArrayJunkPrefix matches a leading empty JSON-array artifact that Grok
+// sometimes glues onto the real shell command for Codex, e.g.
+//
+//	"[    ]Get-Content ..."  →  "Get-Content ..."
+//	"[]Write-Output 'ok'"    →  "Write-Output 'ok'"
+//
+// Four-space form is common in live Codex sessions (2026-07-20). PowerShell
+// then parses "[    ]Write-Output" as a type-cast and fails with
+// "Missing type name after '['".
+var emptyArrayJunkPrefix = regexp.MustCompile(`^\s*\[\s*\]\s*`)
+
 // normalizeShellCommand always returns a non-empty string (or nil if incomplete).
 //
 // Codex exec_command / shell local schema requires:
@@ -671,30 +758,47 @@ func normalizeShellCommand(value any) any {
 	case nil:
 		return nil
 	case string:
-		s := strings.TrimSpace(v)
+		s := stripShellCommandJunk(strings.TrimSpace(v))
 		if s == "" {
 			return nil
 		}
 		// Unwrap accidental JSON-encoded argv: "[\"ls\",\"-la\"]"
+		// Also reject pure empty-array strings ("[]", "[    ]") which used to
+		// fall through and become a "valid" command that later glued onto real text.
 		if (strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]")) ||
 			(strings.HasPrefix(s, `"[`) && strings.Contains(s, `]`)) {
 			var arr []any
 			if json.Unmarshal([]byte(s), &arr) == nil {
 				if flat := flattenCommandParts(arr); len(flat) > 0 {
-					return joinShellArgv(flat)
+					return joinShellArgv(flat, DialectPOSIX)
 				}
+				// Parsed as empty array — not a usable command.
+				return nil
 			}
 			var unquoted string
 			if json.Unmarshal([]byte(s), &unquoted) == nil {
-				unquoted = strings.TrimSpace(unquoted)
+				unquoted = stripShellCommandJunk(strings.TrimSpace(unquoted))
 				if unquoted != "" && unquoted[0] == '[' {
 					if json.Unmarshal([]byte(unquoted), &arr) == nil {
 						if flat := flattenCommandParts(arr); len(flat) > 0 {
-							return joinShellArgv(flat)
+							return joinShellArgv(flat, DialectPOSIX)
 						}
+						return nil
 					}
 				}
+				if unquoted != "" {
+					return unquoted
+				}
 			}
+		}
+		// Leading empty-array junk + real command: "[    ]Get-Content ..."
+		if cleaned := emptyArrayJunkPrefix.ReplaceAllString(s, ""); cleaned != s {
+			cleaned = strings.TrimSpace(cleaned)
+			if cleaned == "" {
+				return nil
+			}
+			// Recurse so nested argv-string cases still flatten.
+			return normalizeShellCommand(cleaned)
 		}
 		return s
 	case []any:
@@ -702,7 +806,7 @@ func normalizeShellCommand(value any) any {
 		if len(flat) == 0 {
 			return nil
 		}
-		return joinShellArgv(flat)
+		return joinShellArgv(flat, DialectPOSIX)
 	case []string:
 		tmp := make([]any, len(v))
 		for i, s := range v {
@@ -719,11 +823,11 @@ func normalizeShellCommand(value any) any {
 					if len(flat) == 0 {
 						return nil
 					}
-					return joinShellArgv(flat)
+					return joinShellArgv(flat, DialectPOSIX)
 				}
 			}
 		}
-		s := strings.TrimSpace(stringify(v))
+		s := stripShellCommandJunk(strings.TrimSpace(stringify(v)))
 		if s == "" || s == "null" || s == "[]" || s == "{}" {
 			return nil
 		}
@@ -731,36 +835,134 @@ func normalizeShellCommand(value any) any {
 	}
 }
 
+// stripShellCommandJunk drops pure empty-array / null-looking shells that must
+// never be treated as a complete Codex cmd.
+func stripShellCommandJunk(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" || s == "[]" || s == "{}" {
+		return ""
+	}
+	// Pure whitespace-inside-brackets empty array: "[    ]", "[ ]", "[\t\n]"
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		if inner == "" {
+			return ""
+		}
+	}
+	return s
+}
+
+// shellDialect is retained only for argv join/quote helpers.
+// We no longer rewrite PowerShell vs bash command text at the proxy boundary:
+// that was cache-hostile (instruction inject) and often damaged real Codex cmds.
+// Outbound path only remaps cmd↔command and preserves workdir/timeout extras.
+type shellDialect int
+
+const (
+	DialectPOSIX shellDialect = iota
+)
+
+// shellDialectName returns a stable log label.
+func shellDialectName(d shellDialect) string {
+	return "passthrough"
+}
+
 // joinShellArgv joins argv parts into one shell command string.
-// Tokens that need quoting (spaces / quotes / meta) are single-quoted POSIX-style.
-func joinShellArgv(parts []string) string {
+// dialect is ignored (passthrough); kept for call-site compatibility.
+func joinShellArgv(parts []string, dialect shellDialect) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
-	out := make([]string, 0, len(parts))
+	cleaned := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		out = append(out, shellQuoteToken(p))
+		cleaned = append(cleaned, p)
 	}
-	if len(out) == 0 {
+	if len(cleaned) == 0 {
 		return ""
+	}
+	if len(cleaned) == 1 {
+		// Full command string already: do not re-quote.
+		return cleaned[0]
+	}
+	// Multi complete statements (spaces inside each part, not bare flags).
+	// Includes PowerShell here-strings (@' ... '@) that Grok often splits across
+	// argv slots — "; " keeps them as sequential statements, not re-quoted tokens.
+	// "; " is also valid bash (sequential), so safe for DialectPOSIX.
+	if allLookLikeShellStatements(cleaned) {
+		return strings.Join(cleaned, "; ")
+	}
+	// Classic argv: quote only meta-bearing tokens.
+	out := make([]string, 0, len(cleaned))
+	for _, p := range cleaned {
+		out = append(out, shellQuoteToken(p, dialect))
 	}
 	return strings.Join(out, " ")
 }
 
-func shellQuoteToken(s string) string {
+// allLookLikeShellStatements is true when every token already looks like a full
+// command line (contains whitespace and is not a bare -flag). Used to decide
+// "; " join vs argv join for multi-part shell args from Grok.
+//
+// Also true when any part is a multi-line here-string body / has newlines, even
+// if a sibling part is a short PowerShell opener like "@'" — Grok splits
+// Set-Content here-strings across argv slots; space-joining + re-quote breaks PS.
+func allLookLikeShellStatements(parts []string) bool {
+	if len(parts) < 2 {
+		return false
+	}
+	hasNewline := false
+	multiWord := 0
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return false
+		}
+		// Bare flags / short tokens that are clearly argv pieces.
+		if strings.HasPrefix(p, "-") && !strings.ContainsAny(p, " \t\n") {
+			return false
+		}
+		if strings.ContainsAny(p, "\n\r") {
+			hasNewline = true
+		}
+		if strings.ContainsAny(p, " \t\n") {
+			multiWord++
+		}
+	}
+	// Classic: every part multi-word → statements.
+	if multiWord == len(parts) {
+		return true
+	}
+	// Here-string / multi-line split across argv: prefer "; " if majority
+	// multi-word and no bare -flags (already filtered).
+	if hasNewline && multiWord >= len(parts)-1 {
+		return true
+	}
+	// PowerShell cmdlet pattern Verb-Noun in every multi-ish part.
+	cmdletish := 0
+	for _, p := range parts {
+		tok := strings.Fields(strings.TrimSpace(p))
+		if len(tok) == 0 {
+			continue
+		}
+		head := tok[0]
+		if strings.Contains(head, "-") && head[0] >= 'A' && head[0] <= 'Z' {
+			cmdletish++
+		}
+	}
+	return cmdletish >= 2 && multiWord >= len(parts)-1
+}
+
+func shellQuoteToken(s string, dialect shellDialect) string {
 	// Safe bare token: alnum + common path/flag chars.
 	safe := true
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-			c == '-' || c == '_' || c == '.' || c == '/' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
+			c == '-' || c == '_' || c == '.' || c == '/' || c == '\\' || c == '=' || c == ':' || c == '@' || c == '+' || c == '%' {
 			continue
 		}
 		safe = false
@@ -769,8 +971,14 @@ func shellQuoteToken(s string) string {
 	if safe {
 		return s
 	}
-	// POSIX single-quote: 'foo'\''bar'
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+	_ = dialect
+	// Prefer double-quote with "" escape. Bash-style '\'' around tokens like
+	// 'rg -n' makes PowerShell treat the first token as a string literal (not a
+	// command) and then ParserError on the next quoted fragment.
+	if !strings.Contains(s, "\"") {
+		return "\"" + s + "\""
+	}
+	return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 }
 
 func flattenCommandParts(parts []any) []string {
@@ -781,7 +989,7 @@ func flattenCommandParts(parts []any) []string {
 		case nil:
 			return
 		case string:
-			s := strings.TrimSpace(t)
+			s := cleanShellToken(strings.TrimSpace(t))
 			if s != "" {
 				out = append(out, s)
 			}
@@ -794,7 +1002,7 @@ func flattenCommandParts(parts []any) []string {
 				walk(item)
 			}
 		default:
-			s := strings.TrimSpace(stringify(t))
+			s := cleanShellToken(strings.TrimSpace(stringify(t)))
 			if s != "" && s != "null" {
 				out = append(out, s)
 			}
@@ -806,7 +1014,25 @@ func flattenCommandParts(parts []any) []string {
 	return out
 }
 
-// shellCommandNonEmpty reports whether a normalized command value is usable.
+// cleanShellToken drops empty-array junk prefixes from a single argv token
+// (e.g. "[    ]Write-Output 'ok'" → "Write-Output 'ok'") and always strips
+// bash dialect artifacts that explode under Codex PowerShell.
+func cleanShellToken(s string) string {
+	// POSIX-safe: only strip empty-array junk. Bash quote-glue MUST stay intact
+	// for Linux CLI clients; PowerShell sanitization runs only at client projection
+	// at projection time (passthrough).
+	s = stripShellCommandJunk(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	if cleaned := emptyArrayJunkPrefix.ReplaceAllString(s, ""); cleaned != s {
+		return strings.TrimSpace(cleaned)
+	}
+	return s
+}
+
+// (PowerShell dialect rewrites removed — shell cmds pass through unchanged.)
+
 func shellCommandNonEmpty(value any) bool {
 	switch v := value.(type) {
 	case nil:
@@ -2604,6 +2830,8 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 		// Hermes "terminal" (and any other command-style shell) uses DefaultShellArgKey.
 		preferredKey = DefaultShellArgKey(toolName)
 	}
+	// Passthrough dialect: never rewrite command text for PowerShell/bash.
+	dialect := DialectPOSIX
 	text := strings.TrimSpace(argsJSON)
 	if text == "" {
 		return argsJSON
@@ -2657,7 +2885,37 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	// Codex / OpenAI shell clients require a STRING for cmd/command — never argv
 	// arrays. Grok frequently emits ["ls","-la"] or nested lists; flatten+join
 	// at the final client projection boundary.
-	strVal := normalizeShellCommand(val)
+	// Use client dialect so Linux bash keeps quote-glue while Codex PowerShell gets
+	// PS-safe quotes + glue-strip — never bake PS rewrites into internal POSIX normalize.
+	var strVal any
+	switch v := val.(type) {
+	case []any:
+		if flat := flattenCommandParts(v); len(flat) > 0 {
+			strVal = joinShellArgv(flat, dialect)
+		}
+	case []string:
+		tmp := make([]any, len(v))
+		for i, s := range v {
+			tmp[i] = s
+		}
+		if flat := flattenCommandParts(tmp); len(flat) > 0 {
+			strVal = joinShellArgv(flat, dialect)
+		}
+	default:
+		strVal = normalizeShellCommand(val)
+		// JSON-array string: flatten to a single command string (no dialect rewrite).
+		if s, ok := val.(string); ok {
+			s = strings.TrimSpace(s)
+			if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+				var arr []any
+				if json.Unmarshal([]byte(s), &arr) == nil {
+					if flat := flattenCommandParts(arr); len(flat) > 0 {
+						strVal = joinShellArgv(flat, dialect)
+					}
+				}
+			}
+		}
+	}
 	if strVal == nil {
 		// Last resort for exotic non-string/non-array leftovers.
 		if s, ok := val.(string); ok {
@@ -2666,7 +2924,7 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 			var arr []any
 			if json.Unmarshal([]byte(encoded), &arr) == nil {
 				if flat := flattenCommandParts(arr); len(flat) > 0 {
-					strVal = joinShellArgv(flat)
+					strVal = joinShellArgv(flat, dialect)
 				}
 			}
 		} else if val != nil {
@@ -2678,6 +2936,18 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 	if strVal == nil {
 		return normalized
 	}
+	// Passthrough: do not rewrite command text. Only remap key + keep extras.
+	// workdir/timeout/justification must survive — Codex App relies on workdir
+	// for project-root anchoring (relative paths).
+	sanitizerApplied := false
+	// Unwrap accidental nested shells: pwsh -Command '...' / powershell -Command "..."
+	// when the host executor is already PowerShell (common Codex Desktop waste).
+	if s, ok := strVal.(string); ok {
+		if unwrapped, ok := unwrapNestedPowerShellCommand(s); ok {
+			strVal = unwrapped
+			sanitizerApplied = true
+		}
+	}
 	// Rebuild: preferred key first, keep non-alias extras (workdir, timeout, ...).
 	out := map[string]any{preferredKey: strVal}
 	for k, v := range obj {
@@ -2686,14 +2956,173 @@ func ProjectShellArgsForClient(argsJSON, toolName, preferredKey string) string {
 		case "command", "cmd", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line":
 			continue
 		default:
-			out[k] = v
+			out[k] = coerceShellNumericField(lk, v)
 		}
 	}
 	encoded, err := compactJSON(out)
 	if err != nil {
+		maybeLogShellArgsProjection(toolName, preferredKey, dialect, sanitizerApplied, argsJSON, normalized)
 		return normalized
 	}
+	maybeLogShellArgsProjection(toolName, preferredKey, dialect, sanitizerApplied, argsJSON, encoded)
 	return encoded
+}
+
+
+// coerceShellNumericField converts JSON float-looking numbers for Codex shell
+// integer fields (yield_time_ms, max_output_tokens, timeout, etc.) to int64.
+// Codex rejects float literals such as 10000.0 with "expected u64".
+func coerceShellNumericField(key string, value any) any {
+	lk := strings.ToLower(strings.TrimSpace(key))
+	switch lk {
+	case "yield_time_ms", "yield_ms", "timeout_ms", "timeout", "max_output_tokens", "max_tokens":
+		// coerce below
+	default:
+		if !strings.HasSuffix(lk, "_ms") && !strings.HasSuffix(lk, "_tokens") {
+			return value
+		}
+	}
+	switch v := value.(type) {
+	case float64:
+		if v == float64(int64(v)) {
+			return int64(v)
+		}
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			return i
+		}
+		if f, err := v.Float64(); err == nil && f == float64(int64(f)) {
+			return int64(f)
+		}
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return value
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil && f == float64(int64(f)) {
+			return int64(f)
+		}
+	}
+	return value
+}
+
+// unwrapNestedPowerShellCommand strips a single redundant outer
+// pwsh/powershell -Command/-c wrapper when the payload is already a full
+// PowerShell script. Avoids "ScriptBlock should only be specified as a value
+// of the Command parameter" when host shell is already pwsh.
+func unwrapNestedPowerShellCommand(cmd string) (string, bool) {
+	s := strings.TrimSpace(cmd)
+	if s == "" {
+		return cmd, false
+	}
+
+	idx, flagLen := findPowerShellCommandFlag(s)
+	if idx < 0 {
+		return cmd, false
+	}
+
+	prefix := strings.TrimSpace(s[:idx])
+	if !isPowerShellLauncherPrefix(prefix) {
+		return cmd, false
+	}
+
+	body := strings.TrimSpace(s[idx+flagLen:])
+	if body == "" {
+		return cmd, false
+	}
+	if len(body) >= 2 {
+		q := body[0]
+		if (q == '\'' || q == '"') && body[len(body)-1] == q {
+			inner := body[1 : len(body)-1]
+			if q == '\'' {
+				inner = strings.ReplaceAll(inner, "''", "'")
+			}
+			body = inner
+		}
+	}
+	body = strings.TrimSpace(body)
+	if body == "" || body == s {
+		return cmd, false
+	}
+	return body, true
+}
+
+func findPowerShellCommandFlag(s string) (idx, flagLen int) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '-' {
+			continue
+		}
+		if i > 0 && s[i-1] != ' ' && s[i-1] != '\t' {
+			continue
+		}
+		rest := s[i+1:]
+		rl := strings.ToLower(rest)
+		if strings.HasPrefix(rl, "command") {
+			end := len("command")
+			if end < len(rest) && (rest[end] == ' ' || rest[end] == '\t' || rest[end] == '=') {
+				flagLen = 1 + end
+				if rest[end] == '=' {
+					flagLen++
+				}
+				return i, flagLen
+			}
+			continue
+		}
+		// Only bare -c (not -Confirm/-Configuration).
+		if strings.HasPrefix(rl, "c") && len(rest) >= 2 {
+			n := rest[1]
+			if n == ' ' || n == '\t' || n == '=' {
+				flagLen = 2
+				if n == '=' {
+					flagLen = 3
+				}
+				return i, flagLen
+			}
+		}
+	}
+	return -1, 0
+}
+
+// isPowerShellLauncherPrefix accepts only a pure pwsh/powershell executable
+// invocation with optional common switches (-NoProfile, -NonInteractive, ...).
+// It rejects prose such as: Write-Output 'pwsh -Command demo'
+func isPowerShellLauncherPrefix(prefix string) bool {
+	p := strings.TrimSpace(prefix)
+	if p == "" {
+		return false
+	}
+	if strings.ContainsAny(p, "|;") || strings.Contains(p, "\n") {
+		return false
+	}
+	fields := strings.Fields(p)
+	if len(fields) == 0 {
+		return false
+	}
+	exe := strings.Trim(fields[0], `"'`)
+	base := strings.ToLower(exe)
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	if base != "pwsh" && base != "pwsh.exe" && base != "powershell" && base != "powershell.exe" {
+		return false
+	}
+	for _, f := range fields[1:] {
+		fl := strings.ToLower(strings.Trim(f, `"'`))
+		if fl == "" {
+			continue
+		}
+		if !strings.HasPrefix(fl, "-") {
+			return false
+		}
+		// Allow short launcher switches only.
+		if len(fl) > 24 || strings.ContainsAny(fl, "(){}") {
+			return false
+		}
+	}
+	return true
 }
 
 func firstNonNil(values ...any) any {
@@ -2704,3 +3133,161 @@ func firstNonNil(values ...any) any {
 	}
 	return nil
 }
+
+// debugShellArgs is the durable admin setting (WebUI → 系统设置 → Relay).
+// Hot-reloaded via ConfigureDebugShellArgs; default off.
+var (
+	debugShellArgsMu      sync.RWMutex
+	debugShellArgsEnabled bool
+	shellArgsDebugOnce    sync.Once
+	// shellArgsLastSig dedups identical projection log lines from stream reassembly.
+	shellArgsDebugMu sync.Mutex
+	shellArgsLastSig string
+)
+
+// ConfigureDebugShellArgs turns on/off shell cmd projection logging from
+// app_settings.debug_shell_args (admin WebUI). Hot without restart.
+func ConfigureDebugShellArgs(enabled bool) {
+	debugShellArgsMu.Lock()
+	prev := debugShellArgsEnabled
+	debugShellArgsEnabled = enabled
+	debugShellArgsMu.Unlock()
+	if enabled && !prev {
+		slog.Info("shell args debug enabled", "source", "admin_settings", "key", "debug_shell_args")
+	} else if !enabled && prev {
+		slog.Info("shell args debug disabled", "source", "admin_settings", "key", "debug_shell_args")
+	}
+}
+
+// DebugShellArgsEnabled reports whether shell projection debug logging is on.
+func DebugShellArgsEnabled() bool {
+	debugShellArgsMu.RLock()
+	defer debugShellArgsMu.RUnlock()
+	return debugShellArgsEnabled
+}
+
+func shellArgsDebugEnabled() bool {
+	return DebugShellArgsEnabled()
+}
+
+func maybeLogShellArgsProjection(toolName, preferredKey string, dialect shellDialect, sanitizerApplied bool, raw, projected string) {
+	if !shellArgsDebugEnabled() {
+		return
+	}
+	shellArgsDebugOnce.Do(func() {
+		slog.Info("shell args projection logging active")
+	})
+	rawCmd := extractShellCmdValue(raw)
+	outCmd := extractShellCmdValue(projected)
+	inputKind := classifyShellCommandInputKind(raw)
+	changed := rawCmd != outCmd
+	// Dedup stream spam; include input_kind so array residual is visible once.
+	shellArgsDebugMu.Lock()
+	sig := toolName + "|" + preferredKey + "|" + inputKind + "|" + rawCmd + "|" + outCmd
+	same := sig == shellArgsLastSig && !changed
+	if !same {
+		shellArgsLastSig = sig
+	}
+	shellArgsDebugMu.Unlock()
+	if same && !sanitizerApplied {
+		return
+	}
+	// workdir preserved?
+	hasWorkdir := false
+	var obj map[string]any
+	if json.Unmarshal([]byte(strings.TrimSpace(projected)), &obj) == nil {
+		if v, ok := obj["workdir"]; ok && !empty(v) {
+			hasWorkdir = true
+		}
+		if v, ok := obj["working_directory"]; ok && !empty(v) {
+			hasWorkdir = true
+		}
+	}
+	slog.Info("shell args projection",
+		"tool", toolName,
+		"preferred_key", preferredKey,
+		"dialect", shellDialectName(dialect),
+		"input_kind", inputKind,
+		"changed", changed,
+		"has_workdir", hasWorkdir,
+		"raw_cmd", truncateForLog(rawCmd, 240),
+		"projected_cmd", truncateForLog(outCmd, 240),
+		"raw_len", len(raw),
+		"projected_len", len(projected),
+	)
+}
+
+// classifyShellCommandInputKind reports how the shell command was encoded in
+// the raw tool arguments (before projection). Used only for debug logs.
+func classifyShellCommandInputKind(argsJSON string) string {
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return "empty"
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(text), &obj) != nil {
+		return "invalid"
+	}
+	for _, k := range []string{"cmd", "command", "argv", "args", "shell_command", "cmdline", "command_line", "script", "bash", "line"} {
+		v, ok := obj[k]
+		if !ok || empty(v) {
+			continue
+		}
+		switch t := v.(type) {
+		case []any, []string:
+			return "array"
+		case string:
+			s := strings.TrimSpace(t)
+			if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+				var arr []any
+				if json.Unmarshal([]byte(s), &arr) == nil {
+					return "array"
+				}
+			}
+			return "string"
+		default:
+			if encoded, err := compactJSON(t); err == nil && strings.HasPrefix(encoded, "[") {
+				return "array"
+			}
+			return "other"
+		}
+	}
+	return "none"
+}
+
+func extractShellCmdValue(argsJSON string) string {
+	text := strings.TrimSpace(argsJSON)
+	if text == "" {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(text), &obj) != nil {
+		return text
+	}
+	for _, k := range []string{"cmd", "command", "argv", "args", "shell_command", "cmdline"} {
+		if v, ok := obj[k]; ok && !empty(v) {
+			if s, ok := v.(string); ok {
+				return s
+			}
+			return stringify(v)
+		}
+	}
+	return text
+}
+
+func truncateForLog(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// Codex shell outbound policy (cache-safe):
+// - Auto-detect Codex via historycompact.LooksLikeCodexRequest / tools schema.
+// - Project shell args: command↔cmd key remap + argv flatten only.
+// - Preserve workdir/timeout and other non-command fields.
+// - Do NOT inject PowerShell instructions into the prompt (would bust cache).
+// - Do NOT rewrite command text (bash↔PS heuristics removed).
+// - Upstream shell schema is string-only; residual arrays are flattened without bash-style single quotes.
+

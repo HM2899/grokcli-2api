@@ -18,6 +18,7 @@ import (
 	"github.com/hm2899/grokcli-2api/internal/modelhealth"
 	"github.com/hm2899/grokcli-2api/internal/models"
 	"github.com/hm2899/grokcli-2api/internal/protocol/historycompact"
+	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 	"github.com/hm2899/grokcli-2api/internal/quota"
 	appruntime "github.com/hm2899/grokcli-2api/internal/runtime"
 	"github.com/hm2899/grokcli-2api/internal/server"
@@ -205,6 +206,9 @@ func main() {
 				}
 				historycompact.ConfigureFull(opts)
 			}
+			if v, ok := settings["debug_shell_args"].(bool); ok {
+				toolcall.ConfigureDebugShellArgs(v)
+			}
 			snap := historycompact.Snapshot()
 			slog.Info("loaded durable settings into runtime config",
 				"default_model", runtimeCfg.DefaultModel,
@@ -212,6 +216,7 @@ func main() {
 				"outbound_max_tools", runtimeCfg.OutboundMaxTools,
 				"history_compact_enabled", snap["enabled"],
 				"history_compact_auto_chars", snap["auto_chars"],
+				"debug_shell_args", toolcall.DebugShellArgsEnabled(),
 			)
 		} else {
 			slog.Warn("failed to load durable settings at boot", "error", err)

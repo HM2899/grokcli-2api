@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.74245c11e2.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.a032ff06be.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -142,8 +142,48 @@
       </header>
       <div class="g2a-mobile-nav" id="mobile-nav"></div>
       <div class="g2a-content">
-
-<section class="g2a-card">
+<div class="g2a-sublayout" data-page-subnav="accounts" data-default-section="accounts">
+  <aside class="g2a-subnav" aria-label="页面分区">
+    <div class="g2a-subnav-label">分区</div>
+      <button type="button" class="g2a-subnav-item" data-section="mode" aria-controls="panel-mode">
+        <span class="g2a-subnav-ico">⟳</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">轮询策略</span>
+          <span class="g2a-subnav-desc">round_robin / least_used</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item is-active" data-section="accounts" aria-controls="panel-accounts">
+        <span class="g2a-subnav-ico">👤</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">Grok 账号</span>
+          <span class="g2a-subnav-desc">列表、额度与设备码登录</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="register" aria-controls="panel-register">
+        <span class="g2a-subnav-ico">✉</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">协议注册</span>
+          <span class="g2a-subnav-desc">邮箱协议批量注册</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="sso" aria-controls="panel-sso">
+        <span class="g2a-subnav-ico">🍪</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">SSO Cookie 导入</span>
+          <span class="g2a-subnav-desc">批量导入 SSO</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="io" aria-controls="panel-io">
+        <span class="g2a-subnav-ico">⇌</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">JSON 导入 / 导出</span>
+          <span class="g2a-subnav-desc">备份与恢复号池</span>
+        </span>
+      </button>
+  </aside>
+  <div class="g2a-submain">
+    <div class="g2a-subpanel" data-section="mode" id="panel-mode" hidden>
+<section id="sec-mode" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>轮询策略</h3>
@@ -165,8 +205,10 @@
     </div>
   </div>
 </section>
+    </div>
 
-<section class="g2a-card">
+    <div class="g2a-subpanel is-active" data-section="accounts" id="panel-accounts">
+<section id="sec-accounts" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>Grok 账号</h3>
@@ -286,8 +328,10 @@
     <span class="g2a-muted g2a-page-size-suffix">/ 页</span>
   </div>
 </section>
+    </div>
 
-<section class="g2a-card">
+    <div class="g2a-subpanel" data-section="register" id="panel-register" hidden>
+<section id="sec-register" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>协议注册</h3>
@@ -310,7 +354,6 @@
         <option value="gptmail">GPTMail（mail.chatgpt.org.uk）</option>
         <option value="cfmail">Cloudflare Temp Email</option>
         <option value="tempmail">TempMail.lol（免费无需 Key）</option>
-        <option value="cloudmail">Cloud Mail（maillab/cloud-mail）</option>
       </select>
     </div>
     <div class="g2a-field" style="grid-column:1/-1">
@@ -379,21 +422,6 @@
       <textarea id="reg-tempmail-domain" class="g2a-input" rows="2" placeholder="免费层级请留空（系统随机域名）；自定义域名需 Plus/Ultra" autocomplete="off" name="reg-tempmail-domain" spellcheck="false"></textarea>
       <div class="g2a-muted" style="margin-top:4px;font-size:12px">API：api.tempmail.lol · 文档 <a href="https://tempmail.lol/zh/api" target="_blank" rel="noopener">tempmail.lol/zh/api</a>。免费：POST /v2/inbox/create（无需 Key），收信 GET /v2/inbox?token=…</div>
     </div>
-
-    <!-- Cloud Mail (maillab/cloud-mail): self-hosted Worker origin + admin_email:password + domains -->
-    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-base" style="grid-column:1/-1;display:none">
-      <label for="reg-cloudmail-base-url">Cloud Mail Base URL</label>
-      <input id="reg-cloudmail-base-url" placeholder="https://skymail.example.com（自托管 Worker 源）" autocomplete="off" name="reg-cloudmail-base-url" />
-    </div>
-    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-key" style="grid-column:1/-1;display:none">
-      <label for="reg-cloudmail-api-key">Cloud Mail 管理员凭据</label>
-      <input id="reg-cloudmail-api-key" placeholder="admin_email:password（POST /api/public/genToken）" autocomplete="off" name="reg-cloudmail-api-key" />
-    </div>
-    <div class="g2a-field reg-mail-panel" data-mail="cloudmail" id="reg-panel-cloudmail-domain" style="grid-column:1/-1;display:none">
-      <label for="reg-cloudmail-domain">Cloud Mail 域名（可多个）</label>
-      <textarea id="reg-cloudmail-domain" class="g2a-input" rows="3" placeholder="一行一个；留空=GET /api/setting/websiteConfig 自动选" autocomplete="off" name="reg-cloudmail-domain" spellcheck="false"></textarea>
-      <div class="g2a-muted" style="margin-top:4px;font-size:12px">仓库 <a href="https://github.com/maillab/cloud-mail" target="_blank" rel="noopener">maillab/cloud-mail</a>。Key 填 <code>admin_email:password</code>，系统调用 <code>/api/public/genToken</code> 拿 token（缓存 25 分钟，401 自动刷新）。建邮箱 <code>/api/public/addUser</code>，收信 <code>/api/public/emailList</code>。与 MoeMail / CF Temp Email 的 Base URL / Key / 域名完全独立。</div>
-    </div>
     <div class="g2a-field">
       <label for="reg-captcha-provider">过盾方式</label>
       <select id="reg-captcha-provider">
@@ -406,7 +434,11 @@
       <input id="reg-yescaptcha-key" placeholder="仅 YesCaptcha 模式需要" />
     </div>
     <div class="g2a-field"><label>数量</label><input id="reg-count" type="number" min="1" value="1" /></div>
-    <div class="g2a-field"><label title="同时注册数（1–4）。受 GROK2API_REG_LOCAL_CONCURRENCY / MAX_CONCURRENCY 上限约束；本地过盾建议 ≤4">线程数</label><input id="reg-concurrency" type="number" min="1" max="4" value="2" /></div>
+    <div class="g2a-field">
+      <label for="reg-concurrency" title="同时注册数；系统按用户输入执行，不设置硬上限">线程数</label>
+      <input id="reg-concurrency" type="number" min="1" step="1" value="2" />
+      <div id="reg-concurrency-warning" hidden style="margin-top:4px;font-size:12px;color:var(--ant-color-error)"></div>
+    </div>
     <div class="g2a-field"><label title="同一波线程启动时的错峰间隔（毫秒）">错峰 ms</label><input id="reg-stagger-ms" type="number" min="0" value="300" /></div>
     <div class="g2a-field">
       <label for="reg-probe-delay-sec" title="新账号入池后等待多少秒再自动测活；0=立即测活">测活等待秒</label>
@@ -449,8 +481,10 @@
     <pre id="reg-log" class="g2a-log is-empty hidden" hidden>—</pre>
   </div>
 </section>
+    </div>
 
-<section class="g2a-card">
+    <div class="g2a-subpanel" data-section="sso" id="panel-sso" hidden>
+<section id="sec-sso" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>SSO Cookie 导入</h3>
@@ -518,8 +552,10 @@
   </div>
   <pre id="sso-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
+    </div>
 
-<section class="g2a-card">
+    <div class="g2a-subpanel" data-section="io" id="panel-io" hidden>
+<section id="sec-json-io" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>JSON 导入 / 导出</h3>
@@ -555,6 +591,11 @@
   </div>
   <pre id="json-io-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
+    </div>
+
+  </div>
+</div>
+
 
       </div>
     </div>
@@ -563,6 +604,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.760b4bf86c.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.cfc11b8162.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.289114c3f5.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.a032ff06be.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -142,8 +142,62 @@
       </header>
       <div class="g2a-mobile-nav" id="mobile-nav"></div>
       <div class="g2a-content">
-
-<section class="g2a-card">
+<div class="g2a-sublayout" data-page-subnav="settings" data-default-section="password">
+  <aside class="g2a-subnav" aria-label="页面分区">
+    <div class="g2a-subnav-label">分区</div>
+      <button type="button" class="g2a-subnav-item is-active" data-section="password" aria-controls="panel-password">
+        <span class="g2a-subnav-ico">🔐</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">管理员密码</span>
+          <span class="g2a-subnav-desc">修改后台登录密码</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="pool" aria-controls="panel-pool">
+        <span class="g2a-subnav-ico">⟳</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">轮询与维护</span>
+          <span class="g2a-subnav-desc">Token 维护与健康探测</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="proxy" aria-controls="panel-proxy">
+        <span class="g2a-subnav-ico">⇄</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">出站代理池</span>
+          <span class="g2a-subnav-desc">账号请求代理设置</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="relay" aria-controls="panel-relay">
+        <span class="g2a-subnav-ico">◈</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">Relay 参数</span>
+          <span class="g2a-subnav-desc">sub2api / 压缩与转发</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="cooldown" aria-controls="panel-cooldown">
+        <span class="g2a-subnav-ico">❄</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">冷却 / 踢出</span>
+          <span class="g2a-subnav-desc">轮询冷却策略</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="sub2api" aria-controls="panel-sub2api">
+        <span class="g2a-subnav-ico">⇪</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">sub2api 导入</span>
+          <span class="g2a-subnav-desc">对接 sub2api 管理端</span>
+        </span>
+      </button>
+      <button type="button" class="g2a-subnav-item" data-section="cliproxyapi" aria-controls="panel-cliproxyapi">
+        <span class="g2a-subnav-ico">⧉</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">CLIProxyAPI</span>
+          <span class="g2a-subnav-desc">CPA auth 同步</span>
+        </span>
+      </button>
+  </aside>
+  <div class="g2a-submain">
+    <div class="g2a-subpanel is-active" data-section="password" id="panel-password">
+<section id="sec-password" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>修改管理员密码</h3>
@@ -187,7 +241,9 @@
     </div>
   </form>
 </section>
+    </div>
 
+    <div class="g2a-subpanel" data-section="pool" id="panel-pool" hidden>
 <section class="g2a-card" id="sec-version">
   <div class="g2a-card-head">
     <div>
@@ -229,7 +285,7 @@
   </div>
 </section>
 
-<section class="g2a-card">
+<section id="sec-pool" class="g2a-card">
   <div class="g2a-card-head">
     <div>
       <h3>轮询与维护</h3>
@@ -296,7 +352,9 @@
     <button type="button" class="g2a-btn g2a-btn-primary" id="btn-save-settings-pool">保存</button>
   </div>
 </section>
+    </div>
 
+    <div class="g2a-subpanel" data-section="proxy" id="panel-proxy" hidden>
 <section class="g2a-card" id="sec-outbound-proxy">
   <div class="g2a-card-head">
     <div>
@@ -336,7 +394,9 @@
     <button type="button" class="g2a-btn g2a-btn-primary" id="btn-save-settings-proxy">保存</button>
   </div>
 </section>
+    </div>
 
+    <div class="g2a-subpanel" data-section="relay" id="panel-relay" hidden>
 <section class="g2a-card" id="sec-relay">
   <div class="g2a-card-head">
     <div>
@@ -390,14 +450,25 @@
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-history-compact" /> 历史压缩（长工具循环时缩小请求体）</label>
     </div>
+    <div class="g2a-actions" style="grid-column:1/-1">
+      <label class="g2a-check"><input type="checkbox" id="set-debug-shell-args" /> Shell 参数调试日志（记录 cmd 投影前后，排查 <code>[    ]</code> 前缀等问题）</label>
+      <div class="g2a-muted" style="margin-top:4px;margin-left:1.6em">开启后服务端日志会打印 preferred_key / has_workdir / raw_cmd / projected_cmd（仅出站投影诊断，不改上游 prompt/cache）；平时请关闭</div>
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <div class="g2a-muted" style="padding:10px 12px;border:1px solid var(--g2a-border, #333);border-radius:8px;line-height:1.55">
+        <strong>Codex App Shell 透传（已内置，无需开关）</strong><br />
+        自动识别 Codex App / CLI 的 <code>exec_command</code>/<code>local_shell</code>（支持 <code>cmd</code> 与 <code>command</code>）。进站 shell schema 仅允许单字符串 <code>command</code>（不再广告 argv 数组）；出站做 <code>command</code>/<code>cmd</code> 键名映射、残留数组扁平化（含空格 token 用双引号，避免 bash 单引号导致 PowerShell ParserError），并保留 <code>workdir</code>/timeout。不注入 PowerShell 规则、不改写命令正文。调试请用上方「Shell 参数调试日志」（默认关，含 <code>input_kind</code>）。
+      </div>
+    </div>
   </div>
   <div class="g2a-actions" style="margin-top:14px;justify-content:flex-end;gap:8px;flex-wrap:wrap">
     <button type="button" class="g2a-btn g2a-btn-default" id="btn-reset-settings-relay">重置默认</button>
     <button type="button" class="g2a-btn g2a-btn-primary" id="btn-save-settings-relay">保存</button>
   </div>
 </section>
+    </div>
 
-
+    <div class="g2a-subpanel" data-section="cooldown" id="panel-cooldown" hidden>
 <section class="g2a-card" id="sec-cooldown">
   <div class="g2a-card-head">
     <div>
@@ -437,7 +508,9 @@
     <button type="button" class="g2a-btn g2a-btn-primary" id="btn-save-settings-cooldown">保存</button>
   </div>
 </section>
+    </div>
 
+    <div class="g2a-subpanel" data-section="sub2api" id="panel-sub2api" hidden>
 <section class="g2a-card" id="sec-sub2api">
   <div class="g2a-card-head">
     <h2>sub2api 导入</h2>
@@ -520,7 +593,9 @@
     勾选「注册成功后自动入库 sub2api」后，协议注册导入本地账号会<strong>立刻</strong>推送到上方配置的分组。
   </p>
 </section>
+    </div>
 
+    <div class="g2a-subpanel" data-section="cliproxyapi" id="panel-cliproxyapi" hidden>
 <section class="g2a-card" id="sec-cliproxyapi">
   <div class="g2a-card-head">
     <h2>CLIProxyAPI（CPA）导入</h2>
@@ -583,24 +658,28 @@
     「导出 CLIProxyAPI」可下载 <code>cliproxyapi-auth-bundle</code> 备份（也可手动拆文件放进 CPA auth 目录）。
   </p>
 </section>
+    </div>
 
-<section class="g2a-card">
-  <div class="g2a-actions" style="justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <div class="g2a-sublayout-foot">
+<div class="g2a-actions" style="justify-content:space-between;flex-wrap:wrap;gap:12px">
     <div class="g2a-muted" id="settings-updated-at">—</div>
     <div class="g2a-actions">
       <button type="button" class="g2a-btn g2a-btn-default" id="btn-reload-settings">重新加载</button>
     </div>
   </div>
   <p class="g2a-muted" style="margin:8px 0 0;line-height:1.5">每个卡片可单独「保存」或「重置默认」（仅影响该卡片）。底部可重新加载全部。</p>
-</section>
+    </div>
+  </div>
+</div>
+
 
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.ac10ff3b58.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.9ac71f7ed9.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.0ab07681e5.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.9e4e4c63cb.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.cfc11b8162.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

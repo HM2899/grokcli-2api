@@ -17,12 +17,13 @@ type ToolDelta struct {
 }
 
 type liveTool struct {
-	id        string
-	name      string
-	arguments string
-	itemID    string
-	output    int
-	emitted   bool
+	id          string
+	name        string
+	arguments   string
+	clientInput string
+	itemID      string
+	output      int
+	emitted     bool
 	// clientAcked is true only after the full function_call group was written.
 	// Soft write failures leave emitted=true but unacked so RequeueUnackedTools
 	// can re-emit a complete added+delta+done cluster ("Tool use interrupted").
@@ -33,24 +34,25 @@ type liveTool struct {
 // numbers. Complete deliberately remains open when no client payload exists so
 // callers can still emit response.failed for an empty upstream HTTP 200.
 type LiveStreamer struct {
-	responseID    string
-	model         string
-	allowed       []string
-	maxTools      int
-	toolsStarted  int
-	sequence      Sequence
-	started       bool
-	closed        bool
-	textOpen      bool
-	reasoningOpen bool
-	messageID     string
-	reasoningID   string
-	text          string
-	reasoning     string
-	output        int
-	textOut       int // output_index of the open text message item (-1 if none)
-	tools         map[int]*liveTool
-	shellArgKeys  map[string]string
+	responseID      string
+	model           string
+	allowed         []string
+	maxTools        int
+	toolsStarted    int
+	sequence        Sequence
+	started         bool
+	closed          bool
+	textOpen        bool
+	reasoningOpen   bool
+	messageID       string
+	reasoningID     string
+	text            string
+	reasoning       string
+	output          int
+	textOut         int // output_index of the open text message item (-1 if none)
+	tools           map[int]*liveTool
+	shellArgKeys    map[string]string
+	customToolNames map[string]bool
 	// pendingClientAcks: tool indexes framed but not yet Ack'd as written.
 	pendingClientAcks []int
 	// pendingTerminal: Complete frames produced but not yet AckTerminal'd.
@@ -75,15 +77,16 @@ func NewLiveStreamer(responseID, model string, allowed []string) *LiveStreamer {
 // maxTools <= 0 means unlimited (Codex / OpenAI-native).
 func NewLiveStreamerWithMaxTools(responseID, model string, allowed []string, maxTools int) *LiveStreamer {
 	return &LiveStreamer{
-		responseID:   responseID,
-		model:        model,
-		allowed:      append([]string(nil), allowed...),
-		maxTools:     maxTools,
-		messageID:    "msg_" + responseID,
-		reasoningID:  "rs_" + responseID,
-		textOut:      -1,
-		tools:        make(map[int]*liveTool),
-		shellArgKeys: map[string]string{},
+		responseID:      responseID,
+		model:           model,
+		allowed:         append([]string(nil), allowed...),
+		maxTools:        maxTools,
+		messageID:       "msg_" + responseID,
+		reasoningID:     "rs_" + responseID,
+		textOut:         -1,
+		tools:           make(map[int]*liveTool),
+		shellArgKeys:    map[string]string{},
+		customToolNames: map[string]bool{},
 	}
 }
 
@@ -97,6 +100,25 @@ func (s *LiveStreamer) SetShellArgKeys(keys map[string]string) {
 		return
 	}
 	s.shellArgKeys = keys
+}
+
+// SetCustomToolNames configures Responses API free-form tools. Internally the
+// upstream sees ordinary function tools with an {input:string} schema; this map
+// restores custom_tool_call/input on the client-facing boundary.
+func (s *LiveStreamer) SetCustomToolNames(names map[string]bool) {
+	if s == nil {
+		return
+	}
+	s.customToolNames = map[string]bool{}
+	for name, custom := range names {
+		if custom {
+			s.customToolNames[name] = true
+		}
+	}
+}
+
+func (s *LiveStreamer) isCustomTool(name string) bool {
+	return s != nil && isCustomToolName(name, s.customToolNames)
 }
 
 func (s *LiveStreamer) projectArgs(toolName, args string) string {
@@ -364,8 +386,48 @@ func (s *LiveStreamer) emitReadyTools(force bool) []string {
 		state.clientAcked = false
 		s.toolsStarted++
 		state.output = s.output
-		state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		custom := s.isCustomTool(state.name)
+		if custom {
+			state.itemID = fmt.Sprintf("ctc_%s_%d", s.responseID, index)
+		} else {
+			state.itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+		}
 		s.pendingClientAcks = append(s.pendingClientAcks, index)
+		if custom {
+			state.clientInput = customToolInput(state.arguments)
+			if state.clientInput == "" {
+				state.emitted = false
+				s.toolsStarted--
+				s.pendingClientAcks = s.pendingClientAcks[:len(s.pendingClientAcks)-1]
+				continue
+			}
+			frames = append(frames,
+				s.sequence.Event("response.output_item.added", map[string]any{
+					"output_index": state.output,
+					"item": map[string]any{
+						"id": state.itemID, "type": "custom_tool_call", "status": "in_progress",
+						"call_id": state.id, "name": state.name, "input": "",
+					},
+				}),
+				s.sequence.Event("response.custom_tool_call_input.delta", map[string]any{
+					"item_id": state.itemID, "output_index": state.output,
+					"delta": state.clientInput,
+				}),
+				s.sequence.Event("response.custom_tool_call_input.done", map[string]any{
+					"item_id": state.itemID, "output_index": state.output,
+					"input": state.clientInput,
+				}),
+				s.sequence.Event("response.output_item.done", map[string]any{
+					"output_index": state.output,
+					"item": map[string]any{
+						"id": state.itemID, "type": "custom_tool_call", "status": "completed",
+						"call_id": state.id, "name": state.name, "input": state.clientInput,
+					},
+				}),
+			)
+			s.output++
+			continue
+		}
 		// Project to the client's shell schema key (Codex: "cmd"; OpenAI: "command").
 		clientArgs := s.projectArgs(state.name, state.arguments)
 		state.arguments = clientArgs
@@ -1000,7 +1062,22 @@ func (s *LiveStreamer) snapshotOutput() []any {
 		}
 		itemID := state.itemID
 		if itemID == "" {
-			itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+			if s.isCustomTool(state.name) {
+				itemID = fmt.Sprintf("ctc_%s_%d", s.responseID, index)
+			} else {
+				itemID = fmt.Sprintf("fc_%s_%d", s.responseID, index)
+			}
+		}
+		if s.isCustomTool(state.name) {
+			input := state.clientInput
+			if input == "" {
+				input = customToolInput(state.arguments)
+			}
+			pieces = append(pieces, piece{index: outIdx, item: map[string]any{
+				"id": itemID, "type": "custom_tool_call", "status": "completed",
+				"call_id": state.id, "name": state.name, "input": input,
+			}})
+			continue
 		}
 		pieces = append(pieces, piece{index: outIdx, item: map[string]any{
 			"id": itemID, "type": "function_call", "status": "completed",

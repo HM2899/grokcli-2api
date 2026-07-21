@@ -943,13 +943,19 @@ func toolsLookLikeCodex(tools any) bool {
 		props := toolProps(tool)
 		if nk == "exec_command" || nk == "shell" || nk == "local_shell" || nk == "run_command" ||
 			strings.HasSuffix(nk, "exec_command") || strings.HasSuffix(nk, "shell") {
+			// Codex Desktop/CLI may advertise cmd or command; either counts.
 			if _, hasCmd := props["cmd"]; hasCmd {
 				shellCmd++
 			}
-			// required: ["cmd"] without command also counts
+			if _, hasCommand := props["command"]; hasCommand {
+				// Prefer exec_command+command as Codex/OpenAI shell signal.
+				if nk == "exec_command" || strings.HasSuffix(nk, "exec_command") || nk == "local_shell" {
+					shellCmd++
+				}
+			}
 			if req, ok := toolRequired(tool); ok {
 				for _, r := range req {
-					if r == "cmd" {
+					if r == "cmd" || (r == "command" && (nk == "exec_command" || strings.HasSuffix(nk, "exec_command") || nk == "local_shell")) {
 						shellCmd++
 					}
 				}

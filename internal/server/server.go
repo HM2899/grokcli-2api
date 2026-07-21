@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -126,6 +127,12 @@ func (o Options) applySettingsToRuntime(settings map[string]any) {
 	}
 	// History compact knobs live in historycompact package (not Config struct).
 	applyHistoryCompactSettings(settings)
+	// Shell projection debug logging (admin WebUI debug_shell_args).
+	if v, ok := settings["debug_shell_args"].(bool); ok {
+		toolcall.ConfigureDebugShellArgs(v)
+	}
+	// PowerShell special policy removed: Codex is auto-detected for outbound
+	// cmd/workdir projection only (cache-safe; no prompt injection).
 }
 
 func applyHistoryCompactSettings(settings map[string]any) {
@@ -2156,6 +2163,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	}
 	stream, _ := raw["stream"].(bool)
 	model := modelCatalog(options).Resolve(stringValue(raw["model"]))
+	customToolNames := responses.CustomToolNameSet(raw["tools"])
 	body := responses.BuildChatBody(raw, model)
 	// Codex shell schema uses "cmd"; remember preferred keys from the *client* tools
 	// before sanitize rewrites them to "command" for upstream Grok.
@@ -2357,6 +2365,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 		w.WriteHeader(http.StatusOK)
 		early := responses.NewLiveStreamerWithMaxTools(responseID, model, allowedResponsesToolNames(body), respPolicy.MaxTools)
 		early.SetShellArgKeys(shellArgKeysFrom(r.Context()))
+		early.SetCustomToolNames(customToolNames)
 		for _, frame := range early.Start() {
 			_, _ = w.Write([]byte(frame))
 		}
@@ -2422,7 +2431,7 @@ func serveResponses(w http.ResponseWriter, r *http.Request, options Options) {
 	if pck != "" {
 		w.Header().Set("X-Grok2API-Prompt-Cache-Key", pck)
 	}
-	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context())), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
+	writeJSON(w, http.StatusOK, responses.BuildObject(responseID, result.Model, content, reasoning, responseToolCalls(toolCalls, shellArgKeysFrom(r.Context()), customToolNames), usageMap(result.Usage), time.Now().Unix(), stringValue(raw["previous_response_id"]), metadataMap(raw["metadata"])))
 }
 
 // effectiveResponsesKeepalive tightens SSE keepalive for tool-heavy Codex turns
@@ -2743,10 +2752,9 @@ func recordResponsesUsage(r *http.Request, options Options, apiKey *auth.APIKeyR
 	}()
 }
 
-func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]string) []map[string]any {
-	keys := map[string]string{}
-	if len(shellArgKeys) > 0 && shellArgKeys[0] != nil {
-		keys = shellArgKeys[0]
+func responseToolCalls(calls []anthropic.ToolCall, keys map[string]string, customToolNames map[string]bool) []map[string]any {
+	if keys == nil {
+		keys = map[string]string{}
 	}
 	out := make([]map[string]any, 0, len(calls))
 	for _, call := range calls {
@@ -2767,14 +2775,18 @@ func responseToolCalls(calls []anthropic.ToolCall, shellArgKeys ...map[string]st
 			}
 			args = toolcall.ProjectShellArgsForClient(args, name, preferred)
 		}
-		out = append(out, map[string]any{
+		item := map[string]any{
 			"id":   call.ID,
 			"type": "function",
 			"function": map[string]any{
 				"name":      name,
 				"arguments": args,
 			},
-		})
+		}
+		if customToolNames[name] || customToolNames[strings.ToLower(name)] || customToolNames[toolcall.NameKey(name)] {
+			item["type"] = "custom"
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -4837,22 +4849,51 @@ func serveRegistrationProxyTest(w http.ResponseWriter, r *http.Request, options 
 	} else if len(targets) > maxTest {
 		targets = targets[:maxTest]
 	}
+	// Probe target for HTTP CONNECT / TCP reachability (registration hits accounts.x.ai).
+	probeHost := strings.TrimSpace(stringValue(body["probe_host"]))
+	if probeHost == "" {
+		probeHost = "accounts.x.ai:443"
+	}
+	timeoutMs := 8000
+	if v, ok := asInt(body["timeout_ms"]); ok && v > 0 {
+		timeoutMs = v
+	}
+	if timeoutMs > 30000 {
+		timeoutMs = 30000
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+
 	results := make([]map[string]any, 0, len(targets))
 	okN := 0
-	for _, url := range targets {
-		// Lightweight TCP/HTTP reachability is not captcha; report configured only.
-		// Full proxy smoke stays in registration workers against xAI.
+	for _, raw := range targets {
+		canonical, cerr := canonicalizeRegistrationProxyLine(raw, user, pass)
 		item := map[string]any{
-			"ok":      true,
-			"proxy":   redactProxyURL(url, user),
-			"message": "proxy entry accepted",
+			"proxy": redactProxyURL(raw, user),
 		}
-		if user != "" && !strings.Contains(url, "@") {
+		if user != "" && !strings.Contains(raw, "@") {
 			item["proxy_username"] = user
 			item["has_password"] = pass != ""
 		}
+		if cerr != nil {
+			item["ok"] = false
+			item["error"] = cerr.Error()
+			item["message"] = "proxy entry parse failed"
+			results = append(results, item)
+			continue
+		}
+		item["proxy"] = redactProxyURL(canonical, user)
+		probe := probeRegistrationProxy(canonical, probeHost, timeout)
+		for k, v := range probe {
+			item[k] = v
+		}
+		if truthy(fmt.Sprint(item["ok"])) {
+			okN++
+		}
 		results = append(results, item)
-		okN++
+	}
+	msg := fmt.Sprintf("probed %d/%d proxy entries ok (target %s)", okN, len(results), probeHost)
+	if okN == 0 {
+		msg = fmt.Sprintf("全部代理探测失败 (target %s) — 注册不会静默直连", probeHost)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":            okN > 0,
@@ -4862,8 +4903,237 @@ func serveRegistrationProxyTest(w http.ResponseWriter, r *http.Request, options 
 		"ok_count":      okN,
 		"fail_count":    len(results) - okN,
 		"results":       results,
-		"message":       fmt.Sprintf("validated %d/%d proxy entries", okN, len(lines)),
+		"probe_host":    probeHost,
+		"message":       msg,
 	})
+}
+
+// canonicalizeRegistrationProxyLine normalizes common proxy paste formats into a URL.
+// Supports: scheme://[user:pass@]host:port, host:port, host:port:user:pass.
+func canonicalizeRegistrationProxyLine(raw, sharedUser, sharedPass string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", fmt.Errorf("empty proxy line")
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "soket5://") {
+		s = "socks5://" + s[len("soket5://"):]
+	} else if strings.HasPrefix(lower, "socket5://") {
+		s = "socks5://" + s[len("socket5://"):]
+	}
+
+	scheme := "http"
+	rest := s
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme = strings.ToLower(strings.TrimSpace(s[:i]))
+		if scheme == "" {
+			scheme = "http"
+		}
+		if scheme == "soket5" || scheme == "socket5" {
+			scheme = "socks5"
+		}
+		rest = s[i+3:]
+	}
+
+	// host:port:user:pass shorthand (no '@', ≥3 colons in rest after optional scheme).
+	if !strings.Contains(rest, "@") {
+		parts := strings.Split(rest, ":")
+		if len(parts) >= 4 {
+			host := strings.TrimSpace(parts[0])
+			port := strings.TrimSpace(parts[1])
+			u := parts[2]
+			p := strings.Join(parts[3:], ":")
+			if host != "" && port != "" {
+				if _, err := strconv.Atoi(port); err == nil {
+					auth := url.UserPassword(u, p)
+					return fmt.Sprintf("%s://%s@%s:%s", scheme, auth.String(), host, port), nil
+				}
+			}
+		}
+	}
+
+	// Bare host:port → http://host:port
+	if !strings.Contains(s, "://") {
+		s = scheme + "://" + rest
+	} else {
+		s = scheme + "://" + rest
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid proxy url: %w", err)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("proxy missing host")
+	}
+	// Apply shared auth when line has no userinfo.
+	if u.User == nil {
+		su := strings.TrimSpace(sharedUser)
+		sp := sharedPass
+		if su != "" {
+			if sp != "" {
+				u.User = url.UserPassword(su, sp)
+			} else {
+				u.User = url.User(su)
+			}
+		}
+	}
+	// Default ports.
+	if u.Port() == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			u.Host = net.JoinHostPort(u.Hostname(), "443")
+		case "socks5", "socks5h", "socks4":
+			u.Host = net.JoinHostPort(u.Hostname(), "1080")
+		default:
+			u.Host = net.JoinHostPort(u.Hostname(), "8080")
+		}
+	}
+	return u.String(), nil
+}
+
+// probeRegistrationProxy performs a real connectivity check through the proxy.
+// HTTP(S) proxies: TCP dial + HTTP CONNECT to probeHost.
+// SOCKS proxies: TCP dial to proxy only (no full SOCKS handshake without extra deps).
+func probeRegistrationProxy(proxyURL, probeHost string, timeout time.Duration) map[string]any {
+	start := time.Now()
+	out := map[string]any{
+		"ok":         false,
+		"probe_host": probeHost,
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Host == "" {
+		out["error"] = "invalid proxy url"
+		out["message"] = "proxy parse failed"
+		return out
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme == "" {
+		scheme = "http"
+	}
+	out["scheme"] = scheme
+	dialHost := u.Host
+	if u.Port() == "" {
+		// Should already be filled by canonicalize, but be defensive.
+		switch scheme {
+		case "https":
+			dialHost = net.JoinHostPort(u.Hostname(), "443")
+		case "socks5", "socks5h", "socks4":
+			dialHost = net.JoinHostPort(u.Hostname(), "1080")
+		default:
+			dialHost = net.JoinHostPort(u.Hostname(), "8080")
+		}
+	}
+
+	conn, err := net.DialTimeout("tcp", dialHost, timeout)
+	if err != nil {
+		out["error"] = err.Error()
+		out["message"] = "tcp dial to proxy failed"
+		out["latency_ms"] = time.Since(start).Milliseconds()
+		return out
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	switch scheme {
+	case "socks5", "socks5h", "socks4", "socks":
+		// Full SOCKS handshake needs extra deps; TCP reachability is still useful
+		// to catch dead hosts / wrong ports (the prior "accepted" check was fake).
+		out["ok"] = true
+		out["message"] = "tcp reachability ok (socks; CONNECT not probed)"
+		out["method"] = "tcp"
+		out["latency_ms"] = time.Since(start).Milliseconds()
+		return out
+	case "https":
+		// TLS-wrapped HTTP proxy is uncommon; treat like TCP ok for now.
+		out["ok"] = true
+		out["message"] = "tcp reachability ok (https proxy; CONNECT skipped)"
+		out["method"] = "tcp"
+		out["latency_ms"] = time.Since(start).Milliseconds()
+		return out
+	default:
+		// HTTP proxy: send CONNECT probeHost HTTP/1.1
+		target := strings.TrimSpace(probeHost)
+		if target == "" {
+			target = "accounts.x.ai:443"
+		}
+		if !strings.Contains(target, ":") {
+			target = target + ":443"
+		}
+		var req strings.Builder
+		req.WriteString("CONNECT ")
+		req.WriteString(target)
+		req.WriteString(" HTTP/1.1\r\nHost: ")
+		req.WriteString(target)
+		req.WriteString("\r\n")
+		if u.User != nil {
+			user := u.User.Username()
+			pass, _ := u.User.Password()
+			token := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+			req.WriteString("Proxy-Authorization: Basic ")
+			req.WriteString(token)
+			req.WriteString("\r\n")
+		}
+		req.WriteString("Proxy-Connection: close\r\nConnection: close\r\n\r\n")
+		if _, err := io.WriteString(conn, req.String()); err != nil {
+			out["error"] = err.Error()
+			out["message"] = "CONNECT write failed"
+			out["latency_ms"] = time.Since(start).Milliseconds()
+			return out
+		}
+		// Read status line only (don't require full tunnel success body).
+		buf := make([]byte, 512)
+		n, rerr := conn.Read(buf)
+		latency := time.Since(start).Milliseconds()
+		out["latency_ms"] = latency
+		if n <= 0 {
+			if rerr != nil {
+				out["error"] = rerr.Error()
+			} else {
+				out["error"] = "empty CONNECT response"
+			}
+			out["message"] = "CONNECT probe failed"
+			out["method"] = "connect"
+			return out
+		}
+		resp := string(buf[:n])
+		// First line: HTTP/1.x 200 ... or 407 etc.
+		first := resp
+		if i := strings.Index(resp, "\r\n"); i >= 0 {
+			first = resp[:i]
+		} else if i := strings.Index(resp, "\n"); i >= 0 {
+			first = resp[:i]
+		}
+		out["connect_status_line"] = strings.TrimSpace(first)
+		out["method"] = "connect"
+		code := 0
+		fields := strings.Fields(first)
+		if len(fields) >= 2 {
+			if c, e := strconv.Atoi(fields[1]); e == nil {
+				code = c
+			}
+		}
+		out["connect_status"] = code
+		if code >= 200 && code < 300 {
+			out["ok"] = true
+			out["message"] = fmt.Sprintf("CONNECT %s ok (%d)", target, code)
+			return out
+		}
+		if code == 407 {
+			out["error"] = "proxy authentication required (407)"
+			out["message"] = "CONNECT 407 — check proxy username/password"
+			return out
+		}
+		if code > 0 {
+			out["error"] = fmt.Sprintf("CONNECT status %d", code)
+			out["message"] = fmt.Sprintf("CONNECT %s failed: %s", target, strings.TrimSpace(first))
+			return out
+		}
+		// Some proxies reply non-HTTP on bad auth; still report body snippet.
+		out["error"] = "unrecognized CONNECT response"
+		out["message"] = "CONNECT probe failed: " + strings.TrimSpace(first)
+		return out
+	}
 }
 
 var registrationSecretKeys = map[string]struct{}{
@@ -4873,7 +5143,6 @@ var registrationSecretKeys = map[string]struct{}{
 	"gptmail_api_key":  {},
 	"cfmail_api_key":   {},
 	"tempmail_api_key": {},
-	"cloudmail_api_key": {},
 	"yescaptcha_key":   {},
 	"proxy_password":   {},
 }
@@ -4923,9 +5192,9 @@ func loadRegistrationConfig(ctx context.Context, options Options, includeSecrets
 	sanitizeRegistrationMailSecrets(cfg)
 	// Always expose per-provider slots so the admin form can bind each service.
 	for _, k := range []string{
-		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
-		"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
-		"moemail_base_url", "cfmail_base_url", "cloudmail_base_url",
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
+		"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
+		"moemail_base_url", "cfmail_base_url",
 	} {
 		if _, ok := cfg[k]; !ok || cfg[k] == nil {
 			cfg[k] = ""
@@ -4992,8 +5261,8 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 	// UI can restore each service independently after switch.
 	for _, k := range []string{
 		"mail_provider",
-		"domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain",
-		"base_url", "moemail_base_url", "cfmail_base_url", "cloudmail_base_url",
+		"domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain",
+		"base_url", "moemail_base_url", "cfmail_base_url",
 	} {
 		if _, ok := current[k]; !ok {
 			current[k] = ""
@@ -5005,7 +5274,7 @@ func saveRegistrationConfig(ctx context.Context, options Options, patch map[stri
 	}
 	// Dedicated API key slots always present in DB (independent per provider).
 	for _, k := range []string{
-		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
 	} {
 		if _, ok := current[k]; !ok || current[k] == nil {
 			current[k] = ""
@@ -5052,18 +5321,6 @@ func mailSecretFitsSlot(key, value string) bool {
 			return false
 		}
 		return true
-	case "cloudmail_api_key":
-		// Cloud Mail (maillab/cloud-mail) credential is admin_email:password
-		// returned by POST /public/genToken. Must contain a colon; reject
-		// MoeMail mk_*, YYDS AC-*, GPTMail sk-* shapes that adapter remaps
-		// could otherwise leak into this slot.
-		if strings.HasPrefix(v, "mk_") || strings.HasPrefix(v, "AC-") || strings.HasPrefix(strings.ToLower(v), "sk-") {
-			return false
-		}
-		if !strings.Contains(v, ":") {
-			return false
-		}
-		return true
 	case "api_key":
 		// Generic active mirror — accept anything; sanitizeRegistrationMailSecrets
 		// rewrites it from the active provider slot.
@@ -5084,7 +5341,6 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 	yk := strings.TrimSpace(stringValue(cfg["yyds_api_key"]))
 	gk := strings.TrimSpace(stringValue(cfg["gptmail_api_key"]))
 	ck := strings.TrimSpace(stringValue(cfg["cfmail_api_key"]))
-	cmk := strings.TrimSpace(stringValue(cfg["cloudmail_api_key"]))
 
 	// Rescue: polluted MoeMail slot holding YYDS key → move into yyds if empty.
 	if strings.HasPrefix(mk, "AC-") {
@@ -5170,25 +5426,6 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 			cfg["tempmail_domain"] = d
 		}
 		cfg["base_url"] = ""
-	case "cloudmail":
-		// Cloud Mail (maillab/cloud-mail): admin_email:password credential +
-		// self-hosted Worker origin. Promote active api_key into the dedicated
-		// slot when the form only sent api_key (legacy mirror path).
-		active := strings.TrimSpace(stringValue(cfg["api_key"]))
-		if cmk == "" && active != "" && mailSecretFitsSlot("cloudmail_api_key", active) {
-			cfg["cloudmail_api_key"] = active
-			cmk = active
-		}
-		cfg["api_key"] = cmk
-		if d := strings.TrimSpace(stringValue(cfg["cloudmail_domain"])); d != "" {
-			cfg["domain"] = d
-		} else if d := strings.TrimSpace(stringValue(cfg["domain"])); d != "" {
-			// Keep domain as display; dedicated slot is source of truth when set.
-			cfg["cloudmail_domain"] = d
-		}
-		if u := strings.TrimSpace(stringValue(cfg["cloudmail_base_url"])); u != "" {
-			cfg["base_url"] = u
-		}
 	default: // moemail
 		cfg["api_key"] = mk
 		if d := strings.TrimSpace(stringValue(cfg["moemail_domain"])); d != "" {
@@ -5206,18 +5443,11 @@ func sanitizeRegistrationMailSecrets(cfg map[string]any) {
 	if _, ok := cfg["tempmail_domain"]; !ok {
 		cfg["tempmail_domain"] = stringValue(cfg["tempmail_domain"])
 	}
-	if _, ok := cfg["cloudmail_api_key"]; !ok {
-		cfg["cloudmail_api_key"] = cmk
-	}
-	if _, ok := cfg["cloudmail_domain"]; !ok {
-		cfg["cloudmail_domain"] = stringValue(cfg["cloudmail_domain"])
-	}
 	_ = mk
 	_ = yk
 	_ = gk
 	_ = ck
 	_ = tk
-	_ = cmk
 }
 
 // registrationConfigPatchForPersist builds a DB-safe patch from a start request.
@@ -5232,7 +5462,7 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 	}
 	// Prefer original request dedicated secrets when present and well-shaped.
 	for _, k := range []string{
-		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key", "cloudmail_api_key",
+		"moemail_api_key", "yyds_api_key", "gptmail_api_key", "cfmail_api_key", "tempmail_api_key",
 		"yescaptcha_key", "proxy_password",
 	} {
 		if req == nil {
@@ -5260,13 +5490,13 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 	}
 	// Restore durable host fields that merge may have cleared for non-MoeMail runs.
 	if req != nil {
-		for _, k := range []string{"moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "base_url"} {
+		for _, k := range []string{"moemail_base_url", "cfmail_base_url", "base_url"} {
 			if s := strings.TrimSpace(stringValue(req[k])); s != "" {
 				out[k] = s
 			}
 		}
 		// Dedicated domains always from request when non-empty.
-		for _, k := range []string{"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "cloudmail_domain", "domain"} {
+		for _, k := range []string{"moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "tempmail_domain", "domain"} {
 			if _, ok := req[k]; ok {
 				// Allow explicit empty to clear.
 				out[k] = strings.TrimSpace(stringValue(req[k]))
@@ -5287,7 +5517,7 @@ func registrationConfigPatchForPersist(req, merged map[string]any) map[string]an
 		if strings.TrimSpace(stringValue(out["moemail_base_url"])) == "" {
 			delete(out, "moemail_base_url")
 		}
-		if provider != "cfmail" && provider != "cloudmail" && strings.TrimSpace(stringValue(out["base_url"])) == "" {
+		if provider != "cfmail" && strings.TrimSpace(stringValue(out["base_url"])) == "" {
 			delete(out, "base_url")
 		}
 	} else {
@@ -5340,8 +5570,8 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 			// the active provider is tempmail and body sent tempmail_domain/domain empty.
 			if strings.TrimSpace(vv) == "" {
 				switch k {
-				case "tempmail_domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain", "cloudmail_domain",
-					"moemail_base_url", "cfmail_base_url", "cloudmail_base_url", "tempmail_api_key", "cloudmail_api_key":
+				case "tempmail_domain", "moemail_domain", "yyds_domain", "gptmail_domain", "cfmail_domain",
+					"moemail_base_url", "cfmail_base_url", "tempmail_api_key":
 					// Dedicated per-provider slots: empty means clear this service only.
 					out[k] = ""
 				case "domain", "base_url":
@@ -5361,7 +5591,7 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 	// Normalize mail_provider first.
 	provider := strings.ToLower(strings.TrimSpace(stringValue(out["mail_provider"])))
 	switch provider {
-	case "yyds", "gptmail", "cfmail", "tempmail", "cloudmail", "moemail":
+	case "yyds", "gptmail", "cfmail", "tempmail", "moemail":
 		// ok
 	default:
 		provider = "moemail"
@@ -5384,10 +5614,6 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 		case "cfmail":
 			if strings.TrimSpace(stringValue(out["cfmail_api_key"])) == "" {
 				out["cfmail_api_key"] = apiKey
-			}
-		case "cloudmail":
-			if strings.TrimSpace(stringValue(out["cloudmail_api_key"])) == "" && mailSecretFitsSlot("cloudmail_api_key", apiKey) {
-				out["cloudmail_api_key"] = apiKey
 			}
 		default: // moemail
 			if strings.TrimSpace(stringValue(out["moemail_api_key"])) == "" && mailSecretFitsSlot("moemail_api_key", apiKey) {
@@ -5425,12 +5651,6 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 			activeDomain = ""
 		}
 		out["tempmail_domain"] = activeDomain
-		out["domain"] = activeDomain
-	case "cloudmail":
-		if d := strings.TrimSpace(stringValue(out["cloudmail_domain"])); d != "" {
-			activeDomain = d
-		}
-		out["cloudmail_domain"] = activeDomain
 		out["domain"] = activeDomain
 	default:
 		if d := strings.TrimSpace(stringValue(out["moemail_domain"])); d != "" {
@@ -5491,26 +5711,6 @@ func mergeRegistrationStartBody(ctx context.Context, options Options, body map[s
 		}
 		out["moemail_base_url"] = ""
 		out["base_url"] = ""
-	case "cloudmail":
-		// Cloud Mail (maillab/cloud-mail): admin_email:password credential +
-		// self-hosted Worker origin. Mirror into moemail_api_key / moemail_base_url
-		// because the Python adapter reads those as the active mail slots.
-		k := strings.TrimSpace(stringValue(out["cloudmail_api_key"]))
-		if k != "" && mailSecretFitsSlot("cloudmail_api_key", k) {
-			out["moemail_api_key"] = k
-			out["api_key"] = k
-		} else {
-			out["cloudmail_api_key"] = ""
-			out["moemail_api_key"] = ""
-			out["api_key"] = ""
-		}
-		if u := strings.TrimSpace(stringValue(out["cloudmail_base_url"])); u != "" {
-			out["moemail_base_url"] = u
-			out["base_url"] = u
-		} else if u := strings.TrimSpace(stringValue(out["base_url"])); u != "" {
-			out["moemail_base_url"] = u
-			out["cloudmail_base_url"] = u
-		}
 	default: // moemail
 		if k := strings.TrimSpace(stringValue(out["moemail_api_key"])); k != "" {
 			// Drop foreign shapes that slipped past load sanitize.
@@ -5556,8 +5756,6 @@ func normalizeRegistrationConfig(raw map[string]any) map[string]any {
 		cfg["mail_provider"] = "cfmail"
 	case "tempmail", "tempmail.lol", "tempmaillol", "tempmail_lol", "lol", "tmlol":
 		cfg["mail_provider"] = "tempmail"
-	case "cloudmail", "cloud-mail", "cloud_mail", "skymail", "maillab":
-		cfg["mail_provider"] = "cloudmail"
 	case "moemail", "moe", "moe-mail":
 		cfg["mail_provider"] = "moemail"
 	}

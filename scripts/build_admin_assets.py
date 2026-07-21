@@ -37,7 +37,8 @@ def main() -> None:
     (DIST / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     for path in sorted(ADMIN.glob("*.html")):
-        html = path.read_text()
+        # Force UTF-8: Windows default locale (e.g. gbk) breaks Chinese admin HTML.
+        html = path.read_text(encoding="utf-8")
         html = re.sub(
             r'href="/static/css/admin-antd\.css[^"]*"',
             f'href="{manifest["admin-antd.css"]}"',
@@ -62,7 +63,7 @@ def main() -> None:
                 f'src="{hashed}"',
                 html,
             )
-        path.write_text(html)
+        path.write_text(html, encoding="utf-8")
         print("html", path.name)
     print("OK")
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/protocol/reasoning"
+	"github.com/hm2899/grokcli-2api/internal/protocol/toolcall"
 )
 
 func BuildChatBody(raw map[string]any, model string) map[string]any {
@@ -84,20 +85,23 @@ func InputToMessages(rawInput any, instructions string) []map[string]any {
 		typeName := strings.ToLower(stringValue(entry["type"]))
 		role := strings.ToLower(stringValue(entry["role"]))
 		switch {
-		case typeName == "function_call_output" || typeName == "tool_result":
+		case typeName == "function_call_output" || typeName == "custom_tool_call_output" || typeName == "tool_result":
 			callID := firstNonEmptyString(entry["call_id"], entry["tool_call_id"])
 			if callID == "" {
 				callID = "call_go"
 			}
 			output := firstNonNil(entry["output"], entry["content"])
 			messages = append(messages, map[string]any{"role": "tool", "tool_call_id": callID, "content": stringify(output)})
-		case typeName == "function_call":
+		case typeName == "function_call" || typeName == "custom_tool_call":
 			callID := firstNonEmptyString(entry["call_id"], entry["id"])
 			if callID == "" {
 				callID = "call_go"
 			}
 			name := stringValue(entry["name"])
 			args := entry["arguments"]
+			if typeName == "custom_tool_call" {
+				args = map[string]any{"input": firstNonNil(entry["input"], entry["arguments"])}
+			}
 			argText, ok := args.(string)
 			if !ok {
 				argText = stringify(args)
@@ -263,7 +267,42 @@ func ConvertTools(raw any) []any {
 	out := []any{}
 	for _, item := range items {
 		tool, ok := item.(map[string]any)
-		if !ok || strings.ToLower(firstNonEmptyString(tool["type"], "function")) != "function" {
+		if !ok {
+			continue
+		}
+		toolType := strings.ToLower(firstNonEmptyString(tool["type"], "function"))
+		if toolType == "custom" {
+			name := stringValue(tool["name"])
+			if name == "" {
+				continue
+			}
+			description := stringValue(tool["description"])
+			const customHint = "Return the custom tool's raw payload in the input string parameter."
+			if description == "" {
+				description = customHint
+			} else if !strings.Contains(strings.ToLower(description), "input string parameter") {
+				description += " " + customHint
+			}
+			if format, _ := firstNonNil(tool["format"], tool["input_format"]).(map[string]any); format != nil {
+				definition := firstNonEmptyString(format["definition"], format["grammar"])
+				if definition != "" {
+					syntax := firstNonEmptyString(format["syntax"], format["type"], "custom")
+					description += "\n\nCustom input grammar (" + syntax + "):\n" + definition
+				}
+			}
+			out = append(out, map[string]any{"type": "function", "function": map[string]any{
+				"name":        name,
+				"description": description,
+				"parameters": map[string]any{
+					"type":                 "object",
+					"properties":           map[string]any{"input": map[string]any{"type": "string", "description": "Raw custom-tool input."}},
+					"required":             []any{"input"},
+					"additionalProperties": false,
+				},
+			}})
+			continue
+		}
+		if toolType != "function" {
 			continue
 		}
 		if _, ok := tool["function"].(map[string]any); ok {
@@ -283,6 +322,60 @@ func ConvertTools(raw any) []any {
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
+}
+
+// CustomToolNameSet returns the names of Responses API free-form custom tools.
+// They are converted to upstream functions, but must be projected back to
+// custom_tool_call/input on the client-facing Responses boundary.
+func CustomToolNameSet(raw any) map[string]bool {
+	out := map[string]bool{}
+	items, _ := raw.([]any)
+	for _, item := range items {
+		tool, _ := item.(map[string]any)
+		if tool == nil || strings.ToLower(stringValue(tool["type"])) != "custom" {
+			continue
+		}
+		name := stringValue(tool["name"])
+		if name == "" {
+			continue
+		}
+		out[name] = true
+		out[strings.ToLower(name)] = true
+		if key := toolcall.NameKey(name); key != "" {
+			out[key] = true
+		}
+	}
+	return out
+}
+
+func isCustomToolName(name string, names map[string]bool) bool {
+	if len(names) == 0 {
+		return false
+	}
+	return names[name] || names[strings.ToLower(name)] || names[toolcall.NameKey(name)]
+}
+
+func customToolInput(arguments any) string {
+	text, ok := arguments.(string)
+	if !ok {
+		text = stringify(arguments)
+	}
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	var obj map[string]any
+	if json.Unmarshal([]byte(trimmed), &obj) == nil {
+		for _, key := range []string{"input", "patch", "diff", "content", "text", "body"} {
+			if value, exists := obj[key]; exists {
+				if input, ok := value.(string); ok {
+					return input
+				}
+				return stringify(value)
+			}
+		}
+	}
+	return text
 }
 
 // ReasoningEffort returns a Grok-safe low|medium|high for Responses bodies.
@@ -307,6 +400,10 @@ func BuildObject(responseID, model, content, reasoning string, toolCalls []map[s
 		callID := firstNonEmptyString(call["id"], call["call_id"])
 		if callID == "" {
 			callID = fmt.Sprintf("call_go_%d", i)
+		}
+		if strings.EqualFold(firstNonEmptyString(call["type"]), "custom") {
+			output = append(output, map[string]any{"id": fmt.Sprintf("ctc_%s_%d", responseID, i), "type": "custom_tool_call", "status": "completed", "call_id": callID, "name": name, "input": customToolInput(args)})
+			continue
 		}
 		output = append(output, map[string]any{"id": fmt.Sprintf("fc_%s_%d", responseID, i), "type": "function_call", "status": "completed", "call_id": callID, "name": name, "arguments": args})
 	}
