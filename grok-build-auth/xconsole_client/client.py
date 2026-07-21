@@ -106,7 +106,7 @@ class XConsoleAuthClient:
         self,
         *,
         transport: str = "curl_cffi",
-        impersonate: str = "chrome131",
+        impersonate: str = "chrome",
         debug: bool = False,
         timeout: float = 30.0,
         proxy: Optional[str] = None,
@@ -192,7 +192,23 @@ class XConsoleAuthClient:
         h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                   "sec-fetch-site": "same-site", "sec-fetch-mode": "navigate",
                   "sec-fetch-dest": "document", "referer": "https://console.x.ai/"})
-        status, _hdrs, _sc, raw = self._request("GET", self.signup_url, headers=h)
+        status, response_headers, _sc, raw = self._request(
+            "GET", self.signup_url, headers=h
+        )
+        if status >= 400:
+            server = str(response_headers.get("server") or "").strip()
+            cf_ray = str(response_headers.get("cf-ray") or "").strip()
+            edge = "Cloudflare" if "cloudflare" in server.lower() or cf_ray else "upstream"
+            ray_detail = f" (cf-ray={cf_ray})" if cf_ray else ""
+            raise RuntimeError(
+                f"Sign-up page request was rejected with HTTP {status} by {edge}{ray_detail}; "
+                "the configured browser fingerprint or proxy egress may be blocked."
+            )
+        if not raw:
+            raise RuntimeError(
+                "Sign-up page returned an empty response body; the proxy or upstream "
+                "connection may have been interrupted."
+            )
         html = raw.decode("utf-8", "replace")
         self._last_signup_html = html
 
@@ -363,6 +379,11 @@ class XConsoleAuthClient:
             else:
                 rest.append(url)
         ordered = priority + rest
+        if not ordered:
+            raise RuntimeError(
+                "Sign-up page did not reference any Next.js JavaScript chunks; "
+                "it may be an anti-bot challenge or block page."
+            )
 
         # 3. fetch chunks in parallel and search for action hashes.
         # We collect ALL results and pick the best one (sign-up chunk > any).
