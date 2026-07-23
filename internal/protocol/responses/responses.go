@@ -80,7 +80,7 @@ func Failure(responseID, model, message, errorType string) []string {
 	}
 	failed := map[string]any{
 		"id": responseID, "object": "response", "status": "failed", "model": model,
-		"error": map[string]any{"type": errorType, "message": message},
+		"error": map[string]any{"type": errorType, "code": errorType, "message": message},
 	}
 	return []string{
 		seq.Event("response.created", map[string]any{"response": initial}),

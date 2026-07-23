@@ -1117,7 +1117,7 @@ func (s *LiveStreamer) Fail(message, errorType string) []string {
 	frames := s.Start()
 	failed := map[string]any{
 		"id": s.responseID, "object": "response", "status": "failed", "model": s.model,
-		"error": map[string]any{"type": errorType, "message": message},
+		"error": map[string]any{"type": errorType, "code": errorType, "message": message},
 	}
 	frames = append(frames,
 		s.sequence.Event("response.failed", map[string]any{"response": failed}),

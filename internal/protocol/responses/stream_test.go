@@ -17,6 +17,9 @@ func TestEmptyCompleteCanStillFail(t *testing.T) {
 	if len(failed) != 2 || !strings.Contains(failed[0], "response.failed") || failed[1] != "data: [DONE]\n\n" {
 		t.Fatalf("unexpected failure %#v", failed)
 	}
+	if !strings.Contains(failed[0], `"code":"server_error"`) {
+		t.Fatalf("response.failed missing error code: %s", failed[0])
+	}
 }
 
 func TestToolStreamUsesStableIDsAndMonotonicSequence(t *testing.T) {
