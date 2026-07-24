@@ -186,7 +186,7 @@ class ProtocolOAuthClient:
         *,
         yescaptcha_key: str = "",
         proxy: str = "",
-        impersonate: str = "chrome131",
+        impersonate: str = "chrome",
         debug: bool = False,
         turnstile_premium: bool = True,
     ):

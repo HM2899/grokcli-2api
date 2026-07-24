@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-const APIVersion = "v1"
+const (
+	APIVersion                 = "v1"
+	maxResponseBodyBytes int64 = 32 << 20
+)
 
 type Client struct {
 	BaseURL string
@@ -24,6 +27,9 @@ type Client struct {
 	// device login, SSO import) that may take ~30s+ due to turnstile
 	// solving and email roundtrips. If nil, falls back to HTTP.
 	HTTPLong *http.Client
+	// HTTPBulk is used only for the full registration sessions list, whose
+	// JSON can take seconds to serialize under large durable batches.
+	HTTPBulk *http.Client
 }
 
 type Error struct {
@@ -158,15 +164,20 @@ func (c *Client) doAbsolute(ctx context.Context, method, absPath string, body an
 	// (tuned for fast polling) doesn't prematurely abort them.
 	if method == http.MethodPost && c.HTTPLong != nil {
 		httpClient = c.HTTPLong
+	} else if method == http.MethodGet && absPath == "/internal/registration/"+APIVersion+"/sessions" && c.HTTPBulk != nil {
+		httpClient = c.HTTPBulk
 	}
 	response, err := httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(payload)) > maxResponseBodyBytes {
+		return nil, fmt.Errorf("registration service response exceeds %d MiB", maxResponseBodyBytes>>20)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var envelope map[string]any

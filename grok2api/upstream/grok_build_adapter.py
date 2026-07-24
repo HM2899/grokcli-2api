@@ -26,6 +26,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from grok2api.upstream.registration_admission import (
+    AdmissionTimeout,
+    RegistrationAdmission,
+)
+
 # This file lives at grok2api/upstream/; repo root is two levels up.
 ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
@@ -132,7 +137,27 @@ try:
     )
 except (TypeError, ValueError):
     _GLOBAL_REG_INFLIGHT_MAX = 4
-_global_reg_inflight = threading.Semaphore(_GLOBAL_REG_INFLIGHT_MAX)
+_reg_admission = RegistrationAdmission(_GLOBAL_REG_INFLIGHT_MAX)
+try:
+    _REG_ADMISSION_TIMEOUT_SEC = max(
+        30.0,
+        min(
+            1800.0,
+            float(os.environ.get("GROK2API_REG_ADMISSION_TIMEOUT_SEC", "600") or 600),
+        ),
+    )
+except (TypeError, ValueError):
+    _REG_ADMISSION_TIMEOUT_SEC = 600.0
+try:
+    _REG_ADMISSION_HEARTBEAT_SEC = max(
+        2.0,
+        min(
+            60.0,
+            float(os.environ.get("GROK2API_REG_ADMISSION_HEARTBEAT_SEC", "10") or 10),
+        ),
+    )
+except (TypeError, ValueError):
+    _REG_ADMISSION_HEARTBEAT_SEC = 10.0
 # Throttle Redis mirror writes: progress still updates local RAM every step;
 # cross-worker / admin poll only needs ~100–200ms freshness.
 _REG_MIRROR_MIN_INTERVAL_SEC = float(os.environ.get("GROK2API_REG_MIRROR_MIN_SEC", "0.12") or 0.12)
@@ -169,28 +194,28 @@ def _note_reg_pressure(reason: str = "", *, pause_sec: float | None = None) -> N
         print(f"[registration] soft-pause {sec:.0f}s ({reason})")
 
 
-def _wait_reg_admission(*, check_cancel=None) -> None:
-    """Block until global inflight slot is free and soft-pause window ends."""
-    while True:
-        if check_cancel is not None:
-            try:
-                check_cancel()
-            except Exception:
-                raise
-        with _reg_soft_pause_lock:
-            wait = _reg_soft_pause_until - time.time()
-        if wait > 0:
-            time.sleep(min(1.0, wait))
-            continue
-        # non-blocking try then short sleep to stay cancel-friendly
-        if _global_reg_inflight.acquire(blocking=False):
-            return
-        time.sleep(0.15)
+def _reg_soft_pause_remaining() -> float:
+    """Return seconds left in the process-wide registration soft pause."""
+
+    with _reg_soft_pause_lock:
+        return max(0.0, _reg_soft_pause_until - time.time())
+
+
+def _wait_reg_admission(*, check_cancel=None, heartbeat=None) -> float:
+    """Wait for global admission while remaining cancel- and health-friendly."""
+
+    return _reg_admission.acquire(
+        check_cancel=check_cancel,
+        heartbeat=heartbeat,
+        pause_remaining=_reg_soft_pause_remaining,
+        timeout_seconds=_REG_ADMISSION_TIMEOUT_SEC,
+        heartbeat_seconds=_REG_ADMISSION_HEARTBEAT_SEC,
+    )
 
 
 def _release_reg_admission() -> None:
     try:
-        _global_reg_inflight.release()
+        _reg_admission.release()
     except Exception:
         pass
 
@@ -1288,6 +1313,7 @@ def registration_available() -> dict[str, Any]:
                 captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY)
             ),
             "moemail_configured": moemail_configured,
+            "admission": _reg_admission.snapshot(),
         }
         return out
     except Exception as e:  # noqa: BLE001
@@ -1310,6 +1336,7 @@ def registration_available() -> dict[str, Any]:
                 captcha_ready if provider == "local" else bool(YESCAPTCHA_KEY)
             ),
             "moemail_configured": moemail_configured,
+            "admission": _reg_admission.snapshot(),
         }
 
 
@@ -2423,7 +2450,27 @@ def _spawn_batch_runner(
                         ):
                             raise _RegCancelled("cancelled while waiting for admission")
 
-                _wait_reg_admission(check_cancel=_job_cancel)
+                def _job_admission_heartbeat(
+                    waited: float,
+                    admission: dict[str, int],
+                ) -> None:
+                    with _lock:
+                        sess2 = _sessions.get(sid)
+                        if not sess2 or str(sess2.get("status") or "") in _TERMINAL_STATUSES:
+                            return
+                        sess2["status"] = "waiting_admission"
+                        sess2["message"] = (
+                            f"waiting for registration admission ({waited:.0f}s; "
+                            f"in_use={admission['in_use']}/{admission['limit']}; "
+                            f"waiters={admission['waiters']})"
+                        )
+                        sess2["updated_at"] = _now()
+                        _mirror_reg_sess(sid, sess2, force=True)
+
+                _wait_reg_admission(
+                    check_cancel=_job_cancel,
+                    heartbeat=_job_admission_heartbeat,
+                )
                 admitted = True
                 _run_registration(
                     sid,
@@ -2432,18 +2479,20 @@ def _spawn_batch_runner(
                     receiver,
                     admission_flag=admission_flag,
                 )
-            except _RegCancelled as e:
+            except (AdmissionTimeout, _RegCancelled) as e:
+                timed_out = isinstance(e, AdmissionTimeout)
+                final_status = "error" if timed_out else "cancelled"
                 with _lock:
                     if sid in _sessions:
-                        _sessions[sid]["status"] = "cancelled"
+                        _sessions[sid]["status"] = final_status
                         _sessions[sid]["error"] = str(e)
                         _sessions[sid]["message"] = str(e)
                         _sessions[sid]["updated_at"] = _now()
-                        _mirror_reg_sess(sid, _sessions[sid])
+                        _mirror_reg_sess(sid, _sessions[sid], force=True)
                 return {
                     "ok": False,
                     "id": sid,
-                    "status": "cancelled",
+                    "status": final_status,
                     "error": str(e),
                 }
             finally:
@@ -4072,6 +4121,7 @@ def _nonterminal_session_statuses() -> frozenset[str]:
             "queued",
             "starting",
             "started",
+            "waiting_admission",
             "running",
             "probing",
             "solving_turnstile",
@@ -4187,6 +4237,7 @@ def reclaim_orphaned_registration_sessions(
         # healthy sessions wait for the lock, but dead runners must free slots
         # much sooner than the old 15min captcha grace (felt permanently stuck).
         long_wait_statuses = {
+            "waiting_admission",
             "solving_turnstile",
             "waiting_email",
             "converting",

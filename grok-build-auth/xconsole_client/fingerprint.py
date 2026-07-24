@@ -8,10 +8,11 @@ performs TLS+HTTP2+header-order impersonation of a real browser at the libcurl
 level (no headless browser required), and lets us match the captured Chrome
 148 / Windows fingerprint.
 
-The default impersonate target is `chrome131` (closest stable preset available
-in `curl_cffi 0.15.0`). The visible User-Agent and most other surface headers
-still come from `xconsole_client.config` so they stay exactly consistent with
-the original capture.
+The default impersonate target is curl_cffi's current `chrome` profile so its
+TLS fingerprint tracks Cloudflare's accepted stable Chrome profile. The visible
+User-Agent and most other surface headers still come from
+`xconsole_client.config` so they stay exactly consistent with the original
+capture.
 
 You can swap to `urllib` (no fingerprint) by setting
 `XConsoleAuthClient(transport="urllib")` for offline code-only tests, but
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover
 
 
 # Defaults that match the captured Chrome 148 / Windows profile.
-DEFAULT_IMPERSONATE = "chrome131"
+DEFAULT_IMPERSONATE = "chrome"
 DEFAULT_HTTP_VERSION = "v2"  # curl_cffi: "v2" or "v3" — accounts.x.ai serves HTTP/2
 DEFAULT_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 DEFAULT_JA3: Optional[str] = None  # let curl_cffi derive from impersonate target
