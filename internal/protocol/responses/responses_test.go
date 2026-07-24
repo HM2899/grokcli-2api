@@ -11,6 +11,9 @@ func TestFailureSequenceIsMonotonicAndDone(t *testing.T) {
 	if len(frames) != 4 || frames[3] != "data: [DONE]\n\n" {
 		t.Fatalf("unexpected frames %#v", frames)
 	}
+	if !strings.Contains(frames[2], `"code":"server_error"`) {
+		t.Fatalf("response.failed missing error code: %s", frames[2])
+	}
 	for index, frame := range frames[:3] {
 		parts := strings.Split(frame, "data: ")
 		if len(parts) != 2 {
