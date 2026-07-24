@@ -4496,6 +4496,36 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// sharedRegistrationLongHTTP is used for long-running POST operations
+// (job creation, device login, SSO import, reclaim/resume) that may take
+// many seconds due to local solver wait / mailbox prepare / warm-up.
+// The short sharedRegistrationHTTP (750ms) stays for GET poll paths only.
+// NOTE: HTTPLong wiring was added then accidentally dropped in a later
+// admin/shell merge; re-wire so client.HTTPLong is actually set.
+var (
+	regHTTPLongClientOnce sync.Once
+	regHTTPLongClient     *http.Client
+)
+
+func sharedRegistrationLongHTTP() *http.Client {
+	regHTTPLongClientOnce.Do(func() {
+		regHTTPLongClient = &http.Client{
+			Timeout: 180 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+				MaxIdleConns:          32,
+				MaxIdleConnsPerHost:   16,
+				MaxConnsPerHost:       16,
+				IdleConnTimeout:       90 * time.Second,
+				// ResponseHeaderTimeout lives on Transport — must also be long.
+				ResponseHeaderTimeout: 120 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPLongClient
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -4516,9 +4546,10 @@ func registrationClient(options Options) *regclient.Client {
 	regClientBase = base
 	regClientToken = token
 	regClientCache = &regclient.Client{
-		BaseURL: base,
-		Token:   token,
-		HTTP:    sharedRegistrationHTTP(),
+		BaseURL:  base,
+		Token:    token,
+		HTTP:     sharedRegistrationHTTP(),
+		HTTPLong: sharedRegistrationLongHTTP(),
 	}
 	return regClientCache
 }

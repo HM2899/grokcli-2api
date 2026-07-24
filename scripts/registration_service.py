@@ -18,6 +18,7 @@ Captcha browser pool itself is the sibling process turnstile-solver
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import sys
@@ -410,7 +411,15 @@ async def start_job(
         "cfmail_base_url", "cloudmail_base_url", "api_key", "base_url",
     ):
         kwargs.pop(drop, None)
-    result = adapter.start_registration(**kwargs)
+    # start_registration is sync and can block for seconds (local solver wait,
+    # mailbox prepare, brief batch warm-up sleep). Running it on the asyncio
+    # event loop freezes the whole sidecar — concurrent /sessions and /stop
+    # then miss Go's 750ms poll budget and surface as admin 502s. Offload so
+    # poll/stop handlers keep answering while start runs in a worker thread.
+    try:
+        result = await asyncio.to_thread(adapter.start_registration, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"registration start failed: {exc}") from exc
     if not isinstance(result, dict):
         raise HTTPException(status_code=500, detail="invalid registration response")
     if result.get("ok") is False:
@@ -591,7 +600,13 @@ async def resume_batch(batch_id: str, request: Request) -> dict[str, Any]:
             force = bool(body.get("force"))
     except Exception:
         force = False
-    return _jsonable(adapter.resume_registration_batch(batch_id, force=force))
+    try:
+        result = await asyncio.to_thread(
+            adapter.resume_registration_batch, batch_id, force=force
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"registration resume failed: {exc}") from exc
+    return _jsonable(result)
 
 
 @app.post(f"{API_PREFIX}/batches/{{batch_id}}/stop")
@@ -612,18 +627,26 @@ async def reclaim(request: Request) -> dict[str, Any]:
             auto_resume = bool(body.get("auto_resume"))
     except Exception:
         pass
-    # Prefer batch reclaim which also reclaims sessions.
-    fn = getattr(adapter, "reclaim_orphaned_registration_batches", None)
-    if callable(fn):
-        # signature may not take auto_resume; call best-effort
-        try:
-            return _jsonable(fn(auto_resume=auto_resume))  # type: ignore[misc]
-        except TypeError:
-            return _jsonable(fn())
-    fn2 = getattr(adapter, "reclaim_orphaned_registration_sessions", None)
-    if callable(fn2):
-        return _jsonable(fn2())
-    return {"ok": True, "reclaimed": 0}
+
+    def _reclaim_sync() -> Any:
+        # Prefer batch reclaim which also reclaims sessions.
+        fn = getattr(adapter, "reclaim_orphaned_registration_batches", None)
+        if callable(fn):
+            # signature may not take auto_resume; call best-effort
+            try:
+                return fn(auto_resume=auto_resume)  # type: ignore[misc]
+            except TypeError:
+                return fn()
+        fn2 = getattr(adapter, "reclaim_orphaned_registration_sessions", None)
+        if callable(fn2):
+            return fn2()
+        return {"ok": True, "reclaimed": 0}
+
+    try:
+        result = await asyncio.to_thread(_reclaim_sync)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"registration reclaim failed: {exc}") from exc
+    return _jsonable(result)
 
 
 @app.post(f"{API_PREFIX}/stop")
@@ -658,7 +681,7 @@ async def device_login_start(request: Request) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"device login unavailable: {exc}") from exc
     try:
-        result = start_login(mode=mode, capture=capture)
+        result = await asyncio.to_thread(start_login, mode=mode, capture=capture)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"device login failed: {exc}") from exc
     if not isinstance(result, dict):
