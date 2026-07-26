@@ -4496,6 +4496,60 @@ func sharedRegistrationHTTP() *http.Client {
 	return regHTTPClient
 }
 
+// sharedRegistrationBulkHTTP is isolated from high-frequency status polling.
+// A durable list with thousands of sessions can take seconds to serialize and
+// transfer even over the loopback sidecar connection.
+var (
+	regHTTPBulkClientOnce sync.Once
+	regHTTPBulkClient     *http.Client
+)
+
+func sharedRegistrationBulkHTTP() *http.Client {
+	regHTTPBulkClientOnce.Do(func() {
+		regHTTPBulkClient = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: time.Second}).DialContext,
+				MaxIdleConns:          8,
+				MaxIdleConnsPerHost:   4,
+				MaxConnsPerHost:       4,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 15 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPBulkClient
+}
+
+// sharedRegistrationLongHTTP is used for long-running POST operations
+// (job creation, device login, SSO import) that may take ~30s+ due to
+// turnstile solving and email roundtrips (e.g. Cloud Mail registration
+// takes ~26s end-to-end). The short sharedRegistrationHTTP (750ms) would
+// prematurely abort these, causing "timeout awaiting response headers".
+var (
+	regHTTPLongClientOnce sync.Once
+	regHTTPLongClient     *http.Client
+)
+
+func sharedRegistrationLongHTTP() *http.Client {
+	regHTTPLongClientOnce.Do(func() {
+		regHTTPLongClient = &http.Client{
+			Timeout: 180 * time.Second,
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+				MaxIdleConns:          32,
+				MaxIdleConnsPerHost:   16,
+				MaxConnsPerHost:       16,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 120 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
+	})
+	return regHTTPLongClient
+}
+
 func registrationClient(options Options) *regclient.Client {
 	base := strings.TrimSpace(options.RegistrationURL)
 	if base == "" {
@@ -4516,9 +4570,11 @@ func registrationClient(options Options) *regclient.Client {
 	regClientBase = base
 	regClientToken = token
 	regClientCache = &regclient.Client{
-		BaseURL: base,
-		Token:   token,
-		HTTP:    sharedRegistrationHTTP(),
+		BaseURL:  base,
+		Token:    token,
+		HTTP:     sharedRegistrationHTTP(),
+		HTTPLong: sharedRegistrationLongHTTP(),
+		HTTPBulk: sharedRegistrationBulkHTTP(),
 	}
 	return regClientCache
 }
